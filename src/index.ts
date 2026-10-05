@@ -1,0 +1,263 @@
+import manifest from "./manifest.json";
+import type { Env } from "./env";
+import { checkClaims, githubFetch } from "./claims";
+import { CALLBACK_PATH, MANIFEST_PATH, SESSION_COOKIE, SESSION_SECONDS } from "./env";
+
+const json = (body: unknown, status = 200, headers = new Headers()): Response => {
+  headers.set("Content-Type", "application/json; charset=utf-8");
+  headers.set("Cache-Control", "no-store");
+  return new Response(JSON.stringify(body), { status, headers });
+};
+const error = (status: number, code: string, hint: string, headers?: Headers) => json({ error: code, hint }, status, headers);
+const canonicalOrigin = (env: Env) => env.CANONICAL_ORIGIN.replace(/\/$/, "");
+const callbackUrl = (env: Env) => `${canonicalOrigin(env)}${CALLBACK_PATH}`;
+const nowIso = () => new Date().toISOString();
+
+async function hmac(secret: string, value: string): Promise<string> {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const digest = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(value));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+function randomId(): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(32));
+  return [...bytes].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function callback(request: Request, env: Env): Promise<Response> {
+  const code = new URL(request.url).searchParams.get("code");
+  if (!code) return error(400, "invalid_code", "The one-time authorization code is missing.");
+  if (!env.RAFT_CLIENT_ID || !env.RAFT_CLIENT_SECRET || !env.SESSION_SECRET) return error(502, "exchange_failed", "Raft login is not configured.");
+
+  let tokenUrl: string;
+  try {
+    const discovery = await fetch("https://api.raft.build/.well-known/openid-configuration", { signal: AbortSignal.timeout(10_000), redirect: "manual" });
+    if (!discovery.ok) throw new Error("discovery unavailable");
+    const config = await discovery.json() as { token_endpoint?: string };
+    if (!config.token_endpoint || new URL(config.token_endpoint).origin !== "https://api.raft.build") throw new Error("invalid token endpoint");
+    tokenUrl = config.token_endpoint;
+  } catch {
+    return error(502, "exchange_failed", "Raft login could not be reached.");
+  }
+
+  let token: { access_token?: string; scope?: string };
+  try {
+    const body = new URLSearchParams({ grant_type: "authorization_code", code, redirect_uri: callbackUrl(env), client_id: env.RAFT_CLIENT_ID, client_secret: env.RAFT_CLIENT_SECRET });
+    const response = await fetch(tokenUrl, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" }, body, redirect: "manual", signal: AbortSignal.timeout(10_000) });
+    if (!response.ok) return error(response.status === 400 ? 400 : 502, response.status === 400 ? "invalid_code" : "exchange_failed", response.status === 400 ? "The authorization code is invalid or expired; run Raft login again." : "Raft could not complete the login exchange.");
+    token = await response.json() as typeof token;
+    if (!token.access_token) throw new Error("missing access token");
+  } catch {
+    return error(502, "exchange_failed", "Raft could not complete the login exchange.");
+  }
+
+  try {
+    const authHeaders = { Authorization: `Bearer ${token.access_token}`, Accept: "application/json" };
+    const [userResponse, serverResponse] = await Promise.all([
+      fetch("https://api.raft.build/api/oauth/userinfo", { headers: authHeaders, redirect: "manual", signal: AbortSignal.timeout(10_000) }),
+      fetch("https://api.raft.build/api/oauth/serverinfo", { headers: authHeaders, redirect: "manual", signal: AbortSignal.timeout(10_000) }),
+    ]);
+    if (!userResponse.ok || !serverResponse.ok) return error(502, "exchange_failed", "Raft identity could not be verified.");
+    const user = await userResponse.json() as Record<string, unknown>;
+    const server = await serverResponse.json() as Record<string, unknown>;
+    const scopes = (token.scope ?? "").split(/[\s,]+/).filter(Boolean);
+    if (!scopes.includes("openid") || !scopes.includes("profile")) return error(403, "not_authorized", "The Raft grant must include openid and profile scopes.");
+    const principalId = user.sub ?? user.id;
+    const serverId = server.id ?? server.server_id;
+    const serverSlug = server.slug;
+    if (!serverId || !serverSlug) return error(403, "server_context_missing", "This login has no Raft server context.");
+    if (!principalId) return error(502, "exchange_failed", "Raft did not return a principal identity.");
+    const blocked = await env.DB.prepare("SELECT 1 FROM blocked_servers WHERE server_id = ?").bind(String(serverId)).first();
+    if (blocked) return error(403, "server_blocked", "This Raft server is blocked from using Claim Check.");
+
+    const id = randomId();
+    const idHash = await hmac(env.SESSION_SECRET, id);
+    const createdAt = new Date();
+    const expiresAt = new Date(createdAt.getTime() + SESSION_SECONDS * 1000).toISOString();
+    await env.DB.batch([
+      env.DB.prepare("UPDATE sessions SET revoked_at = ? WHERE server_id = ? AND principal_id = ? AND revoked_at IS NULL").bind(createdAt.toISOString(), String(serverId), String(principalId)),
+      env.DB.prepare("INSERT INTO sessions (id_hash, server_id, server_slug, server_name, principal_id, principal_type, display_name, scopes, created_at, expires_at, revoked_at) VALUES (?, ?, ?, ?, ?, 'agent', ?, ?, ?, ?, NULL)").bind(idHash, String(serverId), String(serverSlug), typeof server.name === "string" ? server.name : String(serverSlug), String(principalId), typeof user.name === "string" ? user.name : typeof user.preferred_username === "string" ? user.preferred_username : null, scopes.join(" "), createdAt.toISOString(), expiresAt),
+    ]);
+    const headers = new Headers();
+    headers.append("Set-Cookie", `${SESSION_COOKIE}=${id}; HttpOnly; Secure; SameSite=Strict; Path=/api/agent; Max-Age=${SESSION_SECONDS}`);
+    return json({ status: "session_created", session_expires_at: expiresAt }, 200, headers);
+  } catch {
+    return error(502, "exchange_failed", "Raft identity could not be verified.");
+  }
+}
+
+interface Session {
+  id_hash: string; server_id: string; server_slug: string; server_name: string | null;
+  principal_id: string; principal_type: string; display_name: string | null; scopes: string; expires_at: string;
+}
+
+function cookieValue(request: Request): string | null {
+  const value = request.headers.get("Cookie")?.split(";").map((part) => part.trim()).find((part) => part.startsWith(`${SESSION_COOKIE}=`));
+  return value ? value.slice(SESSION_COOKIE.length + 1) : null;
+}
+
+async function authenticate(request: Request, env: Env): Promise<{ session?: Session; response?: Response }> {
+  const rawId = cookieValue(request);
+  if (!rawId || !/^[a-f0-9]{64}$/.test(rawId) || !env.SESSION_SECRET) return { response: error(401, "not_authenticated", "Run raft integration login to create a Claim Check session.") };
+  const idHash = await hmac(env.SESSION_SECRET, rawId);
+  const session = await env.DB.prepare("SELECT id_hash, server_id, server_slug, server_name, principal_id, principal_type, display_name, scopes, expires_at FROM sessions WHERE id_hash = ? AND expires_at > ? AND revoked_at IS NULL").bind(idHash, nowIso()).first<Session>();
+  if (!session || !session.scopes.split(" ").includes("openid") || !session.scopes.split(" ").includes("profile")) return { response: error(401, "not_authenticated", "Run raft integration login to create a Claim Check session.") };
+  const blocked = await env.DB.prepare("SELECT 1 FROM blocked_servers WHERE server_id = ?").bind(session.server_id).first();
+  if (blocked) return { response: error(403, "not_authorized", "This Raft server is not authorized to use Claim Check.") };
+  return { session };
+}
+
+async function reserveRead(env: Env, session: Session): Promise<Response | undefined> {
+  const now = Date.now();
+  const result = await env.DB.prepare("INSERT INTO rate_reservations (server_id, principal_id, action, claim_count, created_at) SELECT ?, ?, 'read', 0, ? WHERE (SELECT COUNT(*) FROM rate_reservations WHERE server_id = ? AND principal_id = ? AND action = 'read' AND created_at > ?) < 120")
+    .bind(session.server_id, session.principal_id, now, session.server_id, session.principal_id, now - 60_000).run();
+  if (result.meta.changes === 1) return;
+  const oldest = await env.DB.prepare("SELECT MIN(created_at) AS oldest FROM rate_reservations WHERE server_id = ? AND principal_id = ? AND action = 'read' AND created_at > ?").bind(session.server_id, session.principal_id, now - 60_000).first<{ oldest: number | null }>();
+  const seconds = Math.max(1, Math.ceil(((oldest?.oldest ?? now) + 60_000 - now) / 1000));
+  const headers = new Headers({ "Retry-After": String(seconds) });
+  return error(429, "rate_limited", "Read limit exceeded; retry after the indicated delay.", headers);
+}
+
+async function reserveClaims(env: Env, session: Session, count: number): Promise<Response | undefined> {
+  const now = Date.now();
+  const result = await env.DB.prepare("INSERT INTO rate_reservations (server_id, principal_id, action, claim_count, created_at) SELECT ?, ?, 'check_claims', ?, ? WHERE (SELECT COUNT(*) FROM rate_reservations WHERE server_id = ? AND principal_id = ? AND action = 'check_claims' AND created_at > ?) < 6 AND (SELECT COALESCE(SUM(claim_count), 0) FROM rate_reservations WHERE server_id = ? AND principal_id = ? AND action = 'check_claims' AND created_at > ?) + ? <= 100 AND (SELECT COALESCE(SUM(claim_count), 0) FROM rate_reservations WHERE server_id = ? AND action = 'check_claims' AND created_at > ?) + ? <= 300")
+    .bind(session.server_id, session.principal_id, count, now, session.server_id, session.principal_id, now - 60_000, session.server_id, session.principal_id, now - 3_600_000, count, session.server_id, now - 3_600_000, count).run();
+  if (result.meta.changes === 1) return;
+  // Work out when all currently exhausted windows can admit this reservation.
+  // The insert above remains the authority: these reads only choose Retry-After.
+  const [agentMinute, agentHour, serverHour] = await Promise.all([
+    env.DB.prepare("SELECT MIN(created_at) AS oldest FROM rate_reservations WHERE server_id = ? AND principal_id = ? AND action = 'check_claims' AND created_at > ?")
+      .bind(session.server_id, session.principal_id, now - 60_000).first<{ oldest: number | null }>(),
+    env.DB.prepare("SELECT created_at, claim_count FROM rate_reservations WHERE server_id = ? AND principal_id = ? AND action = 'check_claims' AND created_at > ? ORDER BY created_at")
+      .bind(session.server_id, session.principal_id, now - 3_600_000).all<{ created_at: number; claim_count: number }>(),
+    env.DB.prepare("SELECT created_at, claim_count FROM rate_reservations WHERE server_id = ? AND action = 'check_claims' AND created_at > ? ORDER BY created_at")
+      .bind(session.server_id, now - 3_600_000).all<{ created_at: number; claim_count: number }>(),
+  ]);
+  let releases: number[] = [];
+  if ((agentMinute?.oldest ?? 0) > now - 60_000) releases.push(agentMinute!.oldest! + 60_000);
+  const releaseForClaims = (rows: { results?: { created_at: number; claim_count: number }[] }, limit: number) => {
+    const items = rows.results ?? [];
+    let total = items.reduce((sum, row) => sum + row.claim_count, 0);
+    if (total + count <= limit) return undefined;
+    for (const row of items) {
+      total -= row.claim_count;
+      if (total + count <= limit) return row.created_at + 3_600_000;
+    }
+    return now + 3_600_000;
+  };
+  const agentRelease = releaseForClaims(agentHour, 100);
+  const serverRelease = releaseForClaims(serverHour, 300);
+  if (agentRelease) releases.push(agentRelease);
+  if (serverRelease) releases.push(serverRelease);
+  const seconds = Math.max(1, Math.ceil(((releases.length ? Math.max(...releases) : now + 1_000) - now) / 1000));
+  return error(429, "rate_limited", "Claim limit exceeded; retry after the indicated delay.", new Headers({ "Retry-After": String(seconds) }));
+}
+
+function receiptId(): string {
+  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  let bits = 0, value = 0, result = "";
+  for (const byte of bytes) { value = (value << 8) | byte; bits += 8; while (bits >= 5) { result += alphabet[(value >>> (bits - 5)) & 31]; bits -= 5; } }
+  if (bits) result += alphabet[(value << (5 - bits)) & 31];
+  return `rcpt_${result}`;
+}
+
+async function action(request: Request, env: Env, actionName: "get-session" | "get-receipt" | "check-claims"): Promise<Response> {
+  const auth = await authenticate(request, env);
+  if (!auth.session) return auth.response!;
+  let body: unknown;
+  try { body = await request.json(); } catch { return actionName === "get-session" ? error(400, "invalid_request", "The request body must be a JSON object.") : error(400, "invalid_request", "The request body must be a JSON object."); }
+  if (!body || typeof body !== "object" || Array.isArray(body)) return error(400, "invalid_request", "The request body must be a JSON object.");
+  if (actionName === "check-claims") {
+    const claims = (body as { claims?: unknown }).claims;
+    if (!Array.isArray(claims) || claims.length < 1 || claims.length > 20) return error(400, "invalid_request", "claims must be an array containing 1 to 20 claim objects.");
+    const limited = await reserveClaims(env, auth.session, claims.length);
+    if (limited) return limited;
+    const need = claims.length * 5;
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    // Expired observations are invalid. Clear stranded reservations and force a
+    // real rate_limit read before any evidence request can be admitted.
+    await env.DB.prepare("UPDATE github_budget SET remaining_reads = 0, reset_at = 0, reserved_inflight = 0 WHERE id = 1 AND reset_at <= ?").bind(nowSeconds).run();
+    const current = await env.DB.prepare("SELECT reset_at FROM github_budget WHERE id = 1").first<{ reset_at: number }>();
+    if (!current || current.reset_at === 0) {
+      try {
+        const response = await githubFetch(env, "/rate_limit");
+        const remText = response.headers.get("x-ratelimit-remaining"), resetText = response.headers.get("x-ratelimit-reset");
+        const remaining = remText !== null && /^\d+$/.test(remText) ? Number(remText) : NaN;
+        const reset = resetText !== null && /^\d+$/.test(resetText) ? Number(resetText) : NaN;
+        if (response.ok && Number.isSafeInteger(remaining) && Number.isSafeInteger(reset) && reset > nowSeconds) {
+          await env.DB.prepare("UPDATE github_budget SET remaining_reads = CASE WHEN ? < reset_at THEN remaining_reads WHEN ? = reset_at THEN MIN(remaining_reads, ?) ELSE ? END, reset_at = MAX(reset_at, ?) WHERE id = 1")
+            .bind(reset, reset, remaining, remaining, reset).run();
+        }
+      } catch { /* fail closed below; no evidence calls without a real observation */ }
+    }
+    const budget = await env.DB.prepare("UPDATE github_budget SET reserved_inflight = reserved_inflight + ? WHERE id = 1 AND remaining_reads - reserved_inflight - ? >= 500").bind(need, need).run();
+    let results;
+    if (budget.meta.changes !== 1) {
+      const row = await env.DB.prepare("SELECT reset_at FROM github_budget WHERE id = 1").first<{ reset_at: number }>();
+      const retryNow = Math.floor(Date.now() / 1000);
+      const retry = row && row.reset_at > retryNow ? Math.max(1, row.reset_at - retryNow) : 3600;
+      results = claims.map((claim, index) => ({ index, claim, verdict: "cant_check", symbol: "⚠️", reason: "github_budget_exhausted", retry_after_seconds: retry, checked_at: nowIso(), source: { system: "github", reads: [] }, acceptance_surface: "GitHub claim evidence", proved: [], not_proved: [], verified: [], inferred: [] }));
+    } else {
+      let observed: { remaining: number; reset: number } | undefined;
+      try {
+        results = await checkClaims(env, claims, (response) => {
+          const remainingText = response.headers.get("x-ratelimit-remaining"), resetText = response.headers.get("x-ratelimit-reset");
+          const remaining = remainingText !== null && /^\d+$/.test(remainingText) ? Number(remainingText) : NaN;
+          const reset = resetText !== null && /^\d+$/.test(resetText) ? Number(resetText) : NaN;
+          if (Number.isSafeInteger(remaining) && Number.isSafeInteger(reset)) observed = { remaining, reset };
+        });
+      } finally {
+        if (observed) await env.DB.prepare("UPDATE github_budget SET reserved_inflight = MAX(0, reserved_inflight - ?), remaining_reads = CASE WHEN ? < reset_at THEN remaining_reads WHEN ? = reset_at THEN MIN(remaining_reads, ?) ELSE ? END, reset_at = MAX(reset_at, ?) WHERE id = 1")
+          .bind(need, observed.reset, observed.reset, observed.remaining, observed.remaining, observed.reset).run();
+        else await env.DB.prepare("UPDATE github_budget SET reserved_inflight = MAX(0, reserved_inflight - ?)").bind(need).run();
+      }
+    }
+    const summary = { confirmed: results.filter((x: any) => x.verdict === "confirmed").length, contradicted: results.filter((x: any) => x.verdict === "contradicted").length, cant_check: results.filter((x: any) => x.verdict === "cant_check").length };
+    const created = new Date(), expires = new Date(created.getTime() + 90 * 86_400_000), id = receiptId();
+    const receipt = { receipt_id: id, created_at: created.toISOString(), expires_at: expires.toISOString(), server: { id: auth.session.server_id, slug: auth.session.server_slug }, requested_by: { principal_id: auth.session.principal_id, principal_type: auth.session.principal_type }, summary, results };
+    await env.DB.prepare("INSERT INTO receipts (id, server_id, principal_id, principal_type, created_at, expires_at, confirmed, contradicted, cant_check, body_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id, auth.session.server_id, auth.session.principal_id, auth.session.principal_type, receipt.created_at, receipt.expires_at, summary.confirmed, summary.contradicted, summary.cant_check, JSON.stringify(receipt)).run();
+    return json(receipt);
+  }
+  // The design intentionally maps malformed and absent IDs to the same 404 as
+  // unknown, expired, deleted, and other-server receipts.
+  const limited = await reserveRead(env, auth.session);
+  if (limited) return limited;
+  if (actionName === "get-session") return json({ principal: { id: auth.session.principal_id, type: auth.session.principal_type, display_name: auth.session.display_name }, server: { id: auth.session.server_id, slug: auth.session.server_slug, name: auth.session.server_name }, session_expires_at: auth.session.expires_at });
+  const id = typeof (body as { receipt_id?: unknown }).receipt_id === "string" ? (body as { receipt_id: string }).receipt_id : "";
+  const receipt = await env.DB.prepare("SELECT body_json FROM receipts WHERE id = ? AND server_id = ? AND expires_at > ?").bind(id, auth.session.server_id, nowIso()).first<{ body_json: string }>();
+  if (!receipt) return error(404, "receipt_not_found", "No accessible, unexpired receipt has that ID.");
+  return new Response(receipt.body_json, { headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } });
+}
+
+async function purge(env: Env): Promise<void> {
+  const now = new Date();
+  const sessionCutoff = new Date(now.getTime() - 7 * 86_400_000).toISOString();
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM receipts WHERE expires_at <= ?").bind(now.toISOString()),
+    env.DB.prepare("DELETE FROM sessions WHERE (expires_at <= ? OR revoked_at <= ?) AND COALESCE(revoked_at, expires_at) <= ?").bind(sessionCutoff, sessionCutoff, sessionCutoff),
+    env.DB.prepare("DELETE FROM rate_reservations WHERE created_at <= ?").bind(now.getTime() - 3_600_000),
+  ]);
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    if (url.origin !== canonicalOrigin(env)) return error(404, "not_found", "No route matches this request.");
+    if (url.pathname === MANIFEST_PATH && request.method === "GET") return json(manifest);
+    if (url.pathname === CALLBACK_PATH && request.method === "GET") return callback(request, env);
+    const routes: Record<string, "get-session" | "get-receipt" | "check-claims"> = {
+      "/api/agent/actions/get-session": "get-session",
+      "/api/agent/actions/get-receipt": "get-receipt",
+      "/api/agent/actions/check-claims": "check-claims",
+    };
+    const route = routes[url.pathname];
+    if (route && request.method === "POST") {
+      const bodyBytes = await request.clone().arrayBuffer();
+      if (bodyBytes.byteLength > 65_536) return error(400, "invalid_request", "Request body exceeds 64 KB.");
+      try { return await action(request, env, route); } catch { return error(500, "internal_error", "The request could not be completed."); }
+    }
+    return error(404, "not_found", "No route matches this request.");
+  },
+  async scheduled(_event: ScheduledController, env: Env): Promise<void> { await purge(env); },
+};

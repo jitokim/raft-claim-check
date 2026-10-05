@@ -1,0 +1,59 @@
+{
+  "schema": "raft-agent-manifest.v0",
+  "service": "claim-check",
+  "name": "Claim Check",
+  "description": "Claim Check verifies structured claims about GitHub state, read-only, and returns a receipt. Each claim gets a verdict: confirmed (✅), contradicted (❌) or can't check (⚠️). Each verdict carries checked_at, the exact GitHub API endpoint read, what the read proves and does not prove, and verified vs inferred facts. v1 reads public GitHub repositories only. Supported claim kinds: pr_merged, pr_state, ci_status, commit_on_branch, issue_closed, tag_exists, release_published. Any other kind is answered with ⚠️, never a guess. Claim Check never runs code or writes to GitHub. Receipts are private to your Raft server and kept for 90 days. Run get_session after login to confirm your session works.",
+  "app_origin": "https://claim-check.ohmygraph.workers.dev",
+  "execution": {
+    "mode": "http_api",
+    "base_url": "https://claim-check.ohmygraph.workers.dev"
+  },
+  "auth": {
+    "type": "login_with_raft",
+    "login_url": "https://claim-check.ohmygraph.workers.dev/auth/agent/callback"
+  },
+  "credential_boundary": {
+    "storage": "slock_managed_token"
+  },
+  "actions": [
+    {
+      "name": "check_claims",
+      "description": "Check 1-20 structured claims against GitHub and store a receipt. Pass the body with --data-json as {\"claims\": [claim, ...]}. Every claim needs kind, owner and repo, plus an optional statement (free text, stored verbatim, never parsed). Other fields depend on kind: pr_merged {number}; pr_state {number, expected_state: open|closed_unmerged|merged}; ci_status {sha (full 40-hex), expected_conclusion: success|failure, check_names?}; commit_on_branch {sha, branch}; issue_closed {number}; tag_exists {tag, sha?}; release_published {tag}. Returns receipt_id, created_at, expires_at, summary and per-claim results with verdict, symbol, reason, retry_after_seconds, checked_at, source.reads, acceptance_surface, proved, not_proved, verified and inferred. A private or nonexistent repo gives ⚠️ repo_not_readable. When GitHub's rate limit is hit, the affected claims give ⚠️ github_rate_limited with retry_after_seconds. When Claim Check's shared GitHub read budget is exhausted before any read, every claim gives ⚠️ github_budget_exhausted with retry_after_seconds.",
+      "endpoint": {
+        "method": "POST",
+        "path": "/api/agent/actions/check-claims"
+      },
+      "parameters": {
+        "claims": {
+          "type": "object",
+          "description": "Request body object whose claims field is a non-empty array of 1-20 claim objects, each with a kind discriminator and typed fields as listed in the action description. Order is preserved in results.",
+          "required": true
+        }
+      }
+    },
+    {
+      "name": "get_receipt",
+      "description": "Read a stored receipt by receipt_id. Returns the exact stored body check_claims returned, including its expires_at. Receipts are visible only to principals of the Raft server that created them. An unknown, expired or other-server receipt returns the same 404 receipt_not_found.",
+      "endpoint": {
+        "method": "POST",
+        "path": "/api/agent/actions/get-receipt"
+      },
+      "parameters": {
+        "receipt_id": {
+          "type": "string",
+          "description": "Receipt ID (receipt_id returned by check_claims).",
+          "required": true
+        }
+      }
+    },
+    {
+      "name": "get_session",
+      "description": "Read-only session check. Returns the authenticated principal, its Raft server and session_expires_at. Run this after raft integration login to confirm the service session works. A 401 means re-run raft integration login.",
+      "endpoint": {
+        "method": "POST",
+        "path": "/api/agent/actions/get-session"
+      },
+      "parameters": {}
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+name = "claim-check"
+main = "src/index.ts"
+compatibility_date = "2026-10-06"
+workers_dev = true
+
+[vars]
+CANONICAL_ORIGIN = "https://claim-check.ohmygraph.workers.dev"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "claim-check"
+database_id = "REPLACE_WITH_CREATED_D1_DATABASE_ID"
+migrations_dir = "migrations"
+
+[triggers]
+crons = ["17 3 * * *"]
