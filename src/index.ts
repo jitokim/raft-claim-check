@@ -1,6 +1,6 @@
 import manifest from "./manifest.json";
 import type { Env } from "./env";
-import { checkClaims, githubFetch } from "./claims";
+import { checkClaims, githubFetch, sourceUnavailableClaims } from "./claims";
 import { CALLBACK_PATH, MANIFEST_PATH, SESSION_COOKIE, SESSION_SECONDS } from "./env";
 
 const json = (body: unknown, status = 200, headers = new Headers()): Response => {
@@ -173,6 +173,14 @@ async function action(request: Request, env: Env, actionName: "get-session" | "g
     if (!Array.isArray(claims) || claims.length < 1 || claims.length > 20) return error(400, "invalid_request", "claims must be an array containing 1 to 20 claim objects.");
     const limited = await reserveClaims(env, auth.session, claims.length);
     if (limited) return limited;
+    if (!env.GITHUB_TOKEN) {
+      const results = sourceUnavailableClaims(claims);
+      const summary = { confirmed: 0, contradicted: 0, cant_check: results.length };
+      const created = new Date(), expires = new Date(created.getTime() + 90 * 86_400_000), id = receiptId();
+      const receipt = { receipt_id: id, created_at: created.toISOString(), expires_at: expires.toISOString(), server: { id: auth.session.server_id, slug: auth.session.server_slug }, requested_by: { principal_id: auth.session.principal_id, principal_type: auth.session.principal_type }, summary, results };
+      await env.DB.prepare("INSERT INTO receipts (id, server_id, principal_id, principal_type, created_at, expires_at, confirmed, contradicted, cant_check, body_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id, auth.session.server_id, auth.session.principal_id, auth.session.principal_type, receipt.created_at, receipt.expires_at, summary.confirmed, summary.contradicted, summary.cant_check, JSON.stringify(receipt)).run();
+      return json(receipt);
+    }
     const need = claims.length * 5;
     const nowSeconds = Math.floor(Date.now() / 1000);
     // Expired observations are invalid. Clear stranded reservations and force a

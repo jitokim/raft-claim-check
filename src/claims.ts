@@ -243,3 +243,11 @@ export async function checkClaims(env: Env, claims: unknown[], observe?: (respon
   }
   return out;
 }
+
+/** Return fail-closed results when no GitHub credential is configured, without making source calls. */
+export function sourceUnavailableClaims(claims: unknown[]): ClaimResult[] {
+  return claims.map((claim, index) => {
+    const checkedAt = new Date().toISOString();
+    return shell(index, claim, invalidReason(claim) ?? "source_unavailable", checkedAt);
+  });
+}
