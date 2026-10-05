@@ -2,7 +2,7 @@
 
 Claim Check is a Raft Connected App, hosted on Cloudflare Workers, that any Raft server can install. An agent sends a structured claim (for example "PR #312 in acme/widgets is merged"). Claim Check checks it **read-only** against its source of truth, which in v1 means the public GitHub REST API. It returns a receipt with one verdict per claim: **confirmed ✅**, **contradicted ❌**, or **can't check ⚠️**. Each verdict comes with the time of the read, the exact endpoint read, what the read proves and does not prove, and which facts were verified and which were inferred. Claim Check never executes anyone's code and never writes to GitHub. It turns the proof-of-work receipt recipe (Raft Manual recipe `proof-of-work-receipts`) into a product.
 
-This document covers design only. The manifest draft is `docs/manifest.draft.json`. Every origin below is a placeholder (see [Hosting](#hosting)).
+This document covers design only. The manifest draft is `docs/manifest.draft.json`. Every origin below is the canonical origin `https://claim-check.ohmygraph.workers.dev` (see [Hosting](#hosting)).
 
 **Manifest schema string: `"raft-agent-manifest.v0"`.** Both prefixes are live today. Raft Artifacts (raft-artifacts.com) serves `slock-agent-manifest.v0`, and tdoc (tdoc.dev) serves `raft-agent-manifest.v0`. tdoc is listed on the Raft Marketplace with the `raft-` string, so Raft's parser accepts it, and v1 uses the current brand name. **Rejected:** copying the `slock-` string from the Raft Artifacts example. `slock` is the older name (the Raft Manual, `integration` topic, says the "former `slock_builtin` Connected App class is retired"), and nothing says new manifests should use it.
 
@@ -143,7 +143,7 @@ Errors return `{ "error": "<code>", "hint": "<one sentence>" }`, which is the sh
 - `400 invalid_request`: the body is not an object, `claims` is missing, or the list inside it is not an array, is empty, or has more than 20 items. A `400` is returned before the rate-limit reservation, so it consumes no budget and makes no GitHub read. A malformed *individual* claim does not fail the request. That claim gets ⚠️ `invalid_claim` or `unsupported_claim_kind`.
 - `401 not_authenticated`: the session is missing, expired, or revoked. The fix is to re-run `raft integration login`.
 - `403 not_authorized`: the server is blocked, or the session has no server context.
-- `429 rate_limited`: the request exceeds a Claim Check limit. The response includes `Retry-After`, and no receipt is created.
+- `429 rate_limited`: the request exceeds a per-agent or per-server Claim Check limit. The response includes `Retry-After`, and no receipt is created. The global GitHub budget never returns `429`. When it is exhausted, every claim gets ⚠️ `github_budget_exhausted` in a stored receipt (see [Rate limits and abuse](#rate-limits-and-abuse)).
 - `500 internal_error`: no receipt is created. Claim Check never returns partial results without a stored receipt.
 
 ### `get_receipt`
@@ -230,7 +230,7 @@ Only after this gate passes may a 404 on a *sub-resource* (a PR number, branch, 
 
 ## Storage
 
-**Decision:** a single **D1** database holds receipts, sessions, rate-limit reservations, and the server block list. **Rejected:** KV. It is eventually consistent, so a revoked session or an exhausted rate window can stay valid on another edge for up to about a minute. It also cannot run the `id AND server_id` lookup as one indexed query. **Also rejected:** no storage at all, because `get_receipt` and revocation both need state.
+**Decision:** a single **D1** database holds receipts, sessions, rate-limit reservations, the global GitHub read budget, and the server block list. **Rejected:** KV. It is eventually consistent, so a revoked session or an exhausted rate window can stay valid on another edge for up to about a minute. It also cannot run the `id AND server_id` lookup as one indexed query. **Also rejected:** no storage at all, because `get_receipt` and revocation both need state.
 
 ```
 receipts(
@@ -273,6 +273,13 @@ rate_reservations(
 INDEX rate_principal (server_id, principal_id, action, created_at)
 INDEX rate_server (server_id, action, created_at)
 
+github_budget(
+  id            INTEGER PRIMARY KEY CHECK (id = 1),  -- exactly one row
+  remaining_reads INTEGER NOT NULL,    -- last accepted x-ratelimit-remaining
+  reset_at      INTEGER NOT NULL,      -- Unix seconds, as in x-ratelimit-reset
+  reserved_inflight INTEGER NOT NULL   -- worst-case reads reserved by requests in flight
+)
+
 blocked_servers(
   server_id     TEXT PRIMARY KEY,
   blocked_at    TEXT NOT NULL,
@@ -280,10 +287,13 @@ blocked_servers(
 )
 ```
 
+The migration seeds the single `github_budget` row once: `id = 1`, `remaining_reads = 5000` (the 5,000/hour figure), `reset_at = 0`, `reserved_inflight = 0`.
+
 `body_json` holds only extracted fields and endpoint paths. It never holds raw GitHub response bodies, request headers, or any token. **Retention:**
 - Receipts: 90 days, then hard-deleted. After that, `get_receipt` returns the same 404 as for an unknown ID.
 - Sessions: rows are deleted 7 days after `expires_at` or `revoked_at`, whichever comes first.
 - Rate reservations: deleted once they are older than one hour, the longest window.
+- GitHub budget: the daily purge never deletes the `github_budget` row.
 
 A daily scheduled purge does the deletion.
 
@@ -304,7 +314,7 @@ A receipt has a **stable ID but no URL** in v1. Agents cite `receipt_id` in hand
 | Claims per agent | **100 / hour** |
 | Claims per server (all its principals) | **300 / hour** |
 | `get_receipt` + `get_session` per agent | **120 / minute** |
-| Global GitHub reserve | stop new checks while `x-ratelimit-remaining < 500` |
+| Global GitHub reserve | reserve the worst case (submitted claims × 5 reads) before any GitHub read, keeping **500** reads unreserved; otherwise every claim gets ⚠️ `github_budget_exhausted` (`200` with a stored receipt, not `429`) |
 
 **Atomic reservation.** After authentication and the request-level `400` checks, and before any GitHub read, `check_claims` makes one conditional reservation. It is a single D1 statement. It inserts one `rate_reservations` row only if the per-agent request count, the per-agent claim count, and the per-server claim count all stay within their caps once this request is added. `:n` is the number of submitted claims.
 
@@ -322,14 +332,54 @@ WHERE (SELECT COUNT(*) FROM rate_reservations
           AND action = 'check_claims' AND created_at > :now - 3600000) + :n <= 300;
 ```
 
-The reservation succeeded only if `meta.changes = 1`. If `meta.changes = 0`, the response is `429 rate_limited`, nothing is recorded, and `Retry-After` comes from the oldest reservation still inside the exhausted window. Two simultaneous requests cannot both pass on the same remaining capacity. A single SQLite write statement is atomic: its count subqueries and its insert run under one write lock. D1 also serialises writes to a database. So the second statement always runs after the first has committed, sees the first row in its subqueries, and fails if that row used up the capacity. `get_receipt` and `get_session` use the same shape with `action = 'read'`, `claim_count = 0`, and the single condition `COUNT(*) < 120` over the last 60 seconds. The global GitHub reserve is checked before the reservation, so a request refused by the reserve consumes no budget.
+The reservation succeeded only if `meta.changes = 1`. If `meta.changes = 0`, the response is `429 rate_limited`, nothing is recorded, and `Retry-After` comes from the oldest reservation still inside the exhausted window. Two simultaneous requests cannot both pass on the same remaining capacity. A single SQLite write statement is atomic: its count subqueries and its insert run under one write lock. D1 also serialises writes to a database. So the second statement always runs after the first has committed, sees the first row in its subqueries, and fails if that row used up the capacity. `get_receipt` and `get_session` use the same shape with `action = 'read'`, `claim_count = 0`, and the single condition `COUNT(*) < 120` over the last 60 seconds. **Order:** authentication, then the request-level `400` checks, then this per-agent/per-server reservation, then the global budget reservation, then GitHub reads. A per-agent/per-server refusal is `429 rate_limited` and consumes nothing from the global budget, because the budget statement never runs. A global budget refusal happens after the per-agent/per-server reservation succeeded, so that reservation stays consumed, and the request gets the ⚠️ `github_budget_exhausted` receipt described below.
 
 - **Malformed or unsupported claims count toward the claim budget.** The reservation is made on the submitted claim count, before per-claim validation. If invalid claims were free, an agent could probe the validator or pad requests at no cost. Counting every submitted claim keeps the budget simple and stops cheap probing.
 - **A failed request is not refunded.** If a request fails with `500` after the reservation but before a receipt is stored, the reservation stays consumed. GitHub reads may already have been spent on it, and a refund write could itself fail and leave the counts inconsistent.
 
-If any of these limits is exceeded, the response is `429 rate_limited` with `Retry-After` and **no receipt**. The global reserve keeps one server from draining the shared token budget. **Rejected:** caching GitHub responses to save budget. A cached read would give a stale verdict with a fresh `checked_at`, which is exactly the false receipt this product exists to prevent.
+**Global GitHub read budget.** Every server shares the one `GITHUB_TOKEN`, so every request draws on one GitHub budget, held in the single `github_budget` row. Before any GitHub read, `check_claims` reserves its worst case, `:need` = claim count × 5 reads. The claim count is the submitted count, the same count the claim budget uses. Immediately before the reservation, a statement clears reservations that crashed Workers left behind, once the stored window has reset:
 
-**When GitHub's own limit is hit mid-request**, the claims already read keep their real verdicts. Every remaining claim gets ⚠️ `github_rate_limited` with `retry_after_seconds`, taken from `Retry-After` or `x-ratelimit-reset`. The request still returns `200` with a stored receipt. Claim Check never substitutes a stale, cached, or guessed verdict.
+```sql
+UPDATE github_budget SET reserved_inflight = 0 WHERE id = 1 AND reset_at <= :now_seconds
+```
+
+The reservation itself is one atomic conditional statement:
+
+```sql
+UPDATE github_budget SET reserved_inflight = reserved_inflight + :need
+WHERE remaining_reads - reserved_inflight - :need >= 500
+```
+
+The reservation succeeded only if `meta.changes = 1`. If `meta.changes = 0`, no GitHub call is made. Every claim in the request gets ⚠️ (`cant_check`) with reason `github_budget_exhausted`, and `retry_after_seconds` is the stored `reset_at` minus now, in seconds. The request returns `200` with a stored receipt. It is a ⚠️ receipt, not a `429`.
+
+After a request whose reservation succeeded, one conditional statement releases the reservation and records GitHub's own count. `:obs_remaining` and `:obs_reset` are the `x-ratelimit-remaining` and `x-ratelimit-reset` of the request's last GitHub response that carried both headers. Responses can complete out of order, so:
+- Observed `reset_at` earlier than stored: the observation is ignored, because it belongs to a stale window.
+- Observed `reset_at` equal to stored: `remaining_reads = MIN(remaining_reads, :obs_remaining)`. Within one window the value only moves down, so an older, higher reading can never overwrite a newer, lower one.
+- Observed `reset_at` later than stored: the new window initializes the row, with `remaining_reads = :obs_remaining` and `reset_at = :obs_reset`.
+
+SQLite evaluates every `SET` expression against the old row values, so the `CASE` compares `:obs_reset` with the stored `reset_at`:
+
+```sql
+UPDATE github_budget SET
+  reserved_inflight = reserved_inflight - :need,
+  remaining_reads = CASE
+    WHEN :obs_reset < reset_at THEN remaining_reads
+    WHEN :obs_reset = reset_at THEN MIN(remaining_reads, :obs_remaining)
+    ELSE :obs_remaining
+  END,
+  reset_at = MAX(reset_at, :obs_reset)
+WHERE id = 1
+```
+
+If that request got no GitHub response carrying both headers, it only releases the reservation:
+
+```sql
+UPDATE github_budget SET reserved_inflight = reserved_inflight - :need WHERE id = 1
+```
+
+If any per-agent or per-server limit is exceeded, the response is `429 rate_limited` with `Retry-After` and **no receipt**. The global GitHub reserve is the exception: it never returns `429`, as described above. The global reserve keeps one server from draining the shared token budget. **Rejected:** caching GitHub responses to save budget. A cached read would give a stale verdict with a fresh `checked_at`, which is exactly the false receipt this product exists to prevent.
+
+**When GitHub's own limit is hit mid-request**, the claims already read keep their real verdicts. Every remaining claim gets ⚠️ `github_rate_limited` with `retry_after_seconds`, taken from `Retry-After` or `x-ratelimit-reset`. `github_rate_limited` is what GitHub itself returns mid-request. `github_budget_exhausted` is Claim Check's own refusal before any read. Both return `200` with a stored receipt. Claim Check never substitutes a stale, cached, or guessed verdict.
 
 Abuse controls:
 - Requests are capped at 64 KB.
@@ -364,16 +414,16 @@ A later version would need these pieces:
 
 ## Hosting
 
-**Decision:** v1 runs on Cloudflare Workers on a **workers.dev** subdomain, with D1 for storage. **Rejected:** a custom domain for v1. The registered callback must match exactly, so every origin change forces a re-registration. We will pick the final origin once, later.
+**Decision:** v1 runs on Cloudflare Workers on a **workers.dev** subdomain, with D1 for storage. **Rejected:** a custom domain for v1. The registered callback must match exactly, so every origin change forces a re-registration. The origin is picked once: the workers.dev origin below.
 
 The canonical origin is a single constant:
 
 ```
-CANONICAL_ORIGIN = "https://claim-check.PLACEHOLDER.workers.dev"   // PLACEHOLDER, not a real origin
+CANONICAL_ORIGIN = "https://claim-check.ohmygraph.workers.dev"
 CALLBACK_URL     = CANONICAL_ORIGIN + "/auth/agent/callback"
 ```
 
-**The value above is a PLACEHOLDER.** `docs/manifest.draft.json` uses the same placeholder for `app_origin`, `base_url`, and `login_url`, and the manifest URL sits on the same origin. All four must be replaced together with the real origin before registration. Nothing in the Worker builds an origin from the `Host` header.
+`docs/manifest.draft.json` uses this origin for `app_origin`, `base_url`, and `login_url`, and the manifest URL sits on the same origin. The origin becomes final only once the Worker is deployed under that name. Nothing in the Worker builds an origin from the `Host` header.
 
 Secrets the Worker needs (names only; values never go in the repo, chat, or docs):
 - `RAFT_CLIENT_ID`: the Raft OAuth client ID. It is not sensitive but is stored next to its secret.
@@ -387,12 +437,11 @@ The manifest is served by the Worker at `CANONICAL_ORIGIN + "/.well-known/raft-a
 
 ## Open questions
 
-**Preflight** means this sequence against the real origin: `raft integration login` → `raft integration invoke --list-actions` → one real action succeeds. This design treats the items under 2, and the exact effect of `credential_boundary`, as unproven until preflight passes.
+**Preflight** means this sequence against the real origin: `raft integration login` → `raft integration invoke --list-actions` → one real action succeeds. This design treats the items under 1, and the exact effect of `credential_boundary`, as unproven until preflight passes.
 
-1. What is the real workers.dev subdomain (the real `CANONICAL_ORIGIN`)? Another lane is setting it up.
-2. VERIFY AT PREFLIGHT, not settled:
+1. VERIFY AT PREFLIGHT, not settled:
    - (a) Does the agent CLI call `login_url` with `GET ?code=…`?
    - (b) Does the token endpoint expect `client_secret_post` or `client_secret_basic`?
    - (c) Does the CLI cookie jar honour `Path=/api/agent` and `SameSite=Strict` when it replays the cookie on actions?
-3. What are GitHub's current rate limits and secondary-limit behaviour? Re-verify against GitHub's docs before implementation.
-4. Does Raft send an uninstall notification when a server uninstalls Claim Check?
+2. What are GitHub's current rate limits and secondary-limit behaviour? Re-verify against GitHub's docs before implementation.
+3. Does Raft send an uninstall notification when a server uninstalls Claim Check?
