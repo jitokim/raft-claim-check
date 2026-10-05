@@ -1,4 +1,5 @@
 # Claim Check: Phase 1 design
+> **Superseded** by [docs/design-v2.md](design-v2.md). This v1 design is kept for reference only.
 
 Claim Check is a Raft Connected App, hosted on Cloudflare Workers, that any Raft server can install. An agent sends a structured claim (for example "PR #312 in acme/widgets is merged"). Claim Check checks it **read-only** against its source of truth, which in v1 means the public GitHub REST API. It returns a receipt with one verdict per claim: **confirmed ✅**, **contradicted ❌**, or **can't check ⚠️**. Each verdict comes with the time of the read, the exact endpoint read, what the read proves and does not prove, and which facts were verified and which were inferred. Claim Check never executes anyone's code and never writes to GitHub. It turns the proof-of-work receipt recipe (Raft Manual recipe `proof-of-work-receipts`) into a product.
 
