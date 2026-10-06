@@ -1,6 +1,5 @@
 import manifest from "./manifest.json";
 import type { Env } from "./env";
-import { checkClaims, githubFetch, sourceUnavailableClaims } from "./claims";
 import { CALLBACK_PATH, MANIFEST_PATH, SESSION_COOKIE, SESSION_SECONDS } from "./env";
 
 const json = (body: unknown, status = 200, headers = new Headers()): Response => {
@@ -118,115 +117,12 @@ async function reserveRead(env: Env, session: Session): Promise<Response | undef
   return error(429, "rate_limited", "Read limit exceeded; retry after the indicated delay.", headers);
 }
 
-async function reserveClaims(env: Env, session: Session, count: number): Promise<Response | undefined> {
-  const now = Date.now();
-  const result = await env.DB.prepare("INSERT INTO rate_reservations (server_id, principal_id, action, claim_count, created_at) SELECT ?, ?, 'check_claims', ?, ? WHERE (SELECT COUNT(*) FROM rate_reservations WHERE server_id = ? AND principal_id = ? AND action = 'check_claims' AND created_at > ?) < 6 AND (SELECT COALESCE(SUM(claim_count), 0) FROM rate_reservations WHERE server_id = ? AND principal_id = ? AND action = 'check_claims' AND created_at > ?) + ? <= 100 AND (SELECT COALESCE(SUM(claim_count), 0) FROM rate_reservations WHERE server_id = ? AND action = 'check_claims' AND created_at > ?) + ? <= 300")
-    .bind(session.server_id, session.principal_id, count, now, session.server_id, session.principal_id, now - 60_000, session.server_id, session.principal_id, now - 3_600_000, count, session.server_id, now - 3_600_000, count).run();
-  if (result.meta.changes === 1) return;
-  // Work out when all currently exhausted windows can admit this reservation.
-  // The insert above remains the authority: these reads only choose Retry-After.
-  const [agentMinute, agentHour, serverHour] = await Promise.all([
-    env.DB.prepare("SELECT MIN(created_at) AS oldest FROM rate_reservations WHERE server_id = ? AND principal_id = ? AND action = 'check_claims' AND created_at > ?")
-      .bind(session.server_id, session.principal_id, now - 60_000).first<{ oldest: number | null }>(),
-    env.DB.prepare("SELECT created_at, claim_count FROM rate_reservations WHERE server_id = ? AND principal_id = ? AND action = 'check_claims' AND created_at > ? ORDER BY created_at")
-      .bind(session.server_id, session.principal_id, now - 3_600_000).all<{ created_at: number; claim_count: number }>(),
-    env.DB.prepare("SELECT created_at, claim_count FROM rate_reservations WHERE server_id = ? AND action = 'check_claims' AND created_at > ? ORDER BY created_at")
-      .bind(session.server_id, now - 3_600_000).all<{ created_at: number; claim_count: number }>(),
-  ]);
-  let releases: number[] = [];
-  if ((agentMinute?.oldest ?? 0) > now - 60_000) releases.push(agentMinute!.oldest! + 60_000);
-  const releaseForClaims = (rows: { results?: { created_at: number; claim_count: number }[] }, limit: number) => {
-    const items = rows.results ?? [];
-    let total = items.reduce((sum, row) => sum + row.claim_count, 0);
-    if (total + count <= limit) return undefined;
-    for (const row of items) {
-      total -= row.claim_count;
-      if (total + count <= limit) return row.created_at + 3_600_000;
-    }
-    return now + 3_600_000;
-  };
-  const agentRelease = releaseForClaims(agentHour, 100);
-  const serverRelease = releaseForClaims(serverHour, 300);
-  if (agentRelease) releases.push(agentRelease);
-  if (serverRelease) releases.push(serverRelease);
-  const seconds = Math.max(1, Math.ceil(((releases.length ? Math.max(...releases) : now + 1_000) - now) / 1000));
-  return error(429, "rate_limited", "Claim limit exceeded; retry after the indicated delay.", new Headers({ "Retry-After": String(seconds) }));
-}
-
-function receiptId(): string {
-  const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-  const bytes = crypto.getRandomValues(new Uint8Array(16));
-  let bits = 0, value = 0, result = "";
-  for (const byte of bytes) { value = (value << 8) | byte; bits += 8; while (bits >= 5) { result += alphabet[(value >>> (bits - 5)) & 31]; bits -= 5; } }
-  if (bits) result += alphabet[(value << (5 - bits)) & 31];
-  return `rcpt_${result}`;
-}
-
-async function action(request: Request, env: Env, actionName: "get-session" | "get-receipt" | "check-claims"): Promise<Response> {
+async function action(request: Request, env: Env, actionName: "get-session" | "get-receipt"): Promise<Response> {
   const auth = await authenticate(request, env);
   if (!auth.session) return auth.response!;
   let body: unknown;
   try { body = await request.json(); } catch { return actionName === "get-session" ? error(400, "invalid_request", "The request body must be a JSON object.") : error(400, "invalid_request", "The request body must be a JSON object."); }
   if (!body || typeof body !== "object" || Array.isArray(body)) return error(400, "invalid_request", "The request body must be a JSON object.");
-  if (actionName === "check-claims") {
-    const claims = (body as { claims?: unknown }).claims;
-    if (!Array.isArray(claims) || claims.length < 1 || claims.length > 20) return error(400, "invalid_request", "claims must be an array containing 1 to 20 claim objects.");
-    const limited = await reserveClaims(env, auth.session, claims.length);
-    if (limited) return limited;
-    if (!env.GITHUB_TOKEN) {
-      const results = sourceUnavailableClaims(claims);
-      const summary = { confirmed: 0, contradicted: 0, cant_check: results.length };
-      const created = new Date(), expires = new Date(created.getTime() + 90 * 86_400_000), id = receiptId();
-      const receipt = { receipt_id: id, created_at: created.toISOString(), expires_at: expires.toISOString(), server: { id: auth.session.server_id, slug: auth.session.server_slug }, requested_by: { principal_id: auth.session.principal_id, principal_type: auth.session.principal_type }, summary, results };
-      await env.DB.prepare("INSERT INTO receipts (id, server_id, principal_id, principal_type, created_at, expires_at, confirmed, contradicted, cant_check, body_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id, auth.session.server_id, auth.session.principal_id, auth.session.principal_type, receipt.created_at, receipt.expires_at, summary.confirmed, summary.contradicted, summary.cant_check, JSON.stringify(receipt)).run();
-      return json(receipt);
-    }
-    const need = claims.length * 5;
-    const nowSeconds = Math.floor(Date.now() / 1000);
-    // Expired observations are invalid. Clear stranded reservations and force a
-    // real rate_limit read before any evidence request can be admitted.
-    await env.DB.prepare("UPDATE github_budget SET remaining_reads = 0, reset_at = 0, reserved_inflight = 0 WHERE id = 1 AND reset_at <= ?").bind(nowSeconds).run();
-    const current = await env.DB.prepare("SELECT reset_at FROM github_budget WHERE id = 1").first<{ reset_at: number }>();
-    if (!current || current.reset_at === 0) {
-      try {
-        const response = await githubFetch(env, "/rate_limit");
-        const remText = response.headers.get("x-ratelimit-remaining"), resetText = response.headers.get("x-ratelimit-reset");
-        const remaining = remText !== null && /^\d+$/.test(remText) ? Number(remText) : NaN;
-        const reset = resetText !== null && /^\d+$/.test(resetText) ? Number(resetText) : NaN;
-        if (response.ok && Number.isSafeInteger(remaining) && Number.isSafeInteger(reset) && reset > nowSeconds) {
-          await env.DB.prepare("UPDATE github_budget SET remaining_reads = CASE WHEN ? < reset_at THEN remaining_reads WHEN ? = reset_at THEN MIN(remaining_reads, ?) ELSE ? END, reset_at = MAX(reset_at, ?) WHERE id = 1")
-            .bind(reset, reset, remaining, remaining, reset).run();
-        }
-      } catch { /* fail closed below; no evidence calls without a real observation */ }
-    }
-    const budget = await env.DB.prepare("UPDATE github_budget SET reserved_inflight = reserved_inflight + ? WHERE id = 1 AND remaining_reads - reserved_inflight - ? >= 500").bind(need, need).run();
-    let results;
-    if (budget.meta.changes !== 1) {
-      const row = await env.DB.prepare("SELECT reset_at FROM github_budget WHERE id = 1").first<{ reset_at: number }>();
-      const retryNow = Math.floor(Date.now() / 1000);
-      const retry = row && row.reset_at > retryNow ? Math.max(1, row.reset_at - retryNow) : 3600;
-      results = claims.map((claim, index) => ({ index, claim, verdict: "cant_check", symbol: "⚠️", reason: "github_budget_exhausted", retry_after_seconds: retry, checked_at: nowIso(), source: { system: "github", reads: [] }, acceptance_surface: "GitHub claim evidence", proved: [], not_proved: [], verified: [], inferred: [] }));
-    } else {
-      let observed: { remaining: number; reset: number } | undefined;
-      try {
-        results = await checkClaims(env, claims, (response) => {
-          const remainingText = response.headers.get("x-ratelimit-remaining"), resetText = response.headers.get("x-ratelimit-reset");
-          const remaining = remainingText !== null && /^\d+$/.test(remainingText) ? Number(remainingText) : NaN;
-          const reset = resetText !== null && /^\d+$/.test(resetText) ? Number(resetText) : NaN;
-          if (Number.isSafeInteger(remaining) && Number.isSafeInteger(reset)) observed = { remaining, reset };
-        });
-      } finally {
-        if (observed) await env.DB.prepare("UPDATE github_budget SET reserved_inflight = MAX(0, reserved_inflight - ?), remaining_reads = CASE WHEN ? < reset_at THEN remaining_reads WHEN ? = reset_at THEN MIN(remaining_reads, ?) ELSE ? END, reset_at = MAX(reset_at, ?) WHERE id = 1")
-          .bind(need, observed.reset, observed.reset, observed.remaining, observed.remaining, observed.reset).run();
-        else await env.DB.prepare("UPDATE github_budget SET reserved_inflight = MAX(0, reserved_inflight - ?)").bind(need).run();
-      }
-    }
-    const summary = { confirmed: results.filter((x: any) => x.verdict === "confirmed").length, contradicted: results.filter((x: any) => x.verdict === "contradicted").length, cant_check: results.filter((x: any) => x.verdict === "cant_check").length };
-    const created = new Date(), expires = new Date(created.getTime() + 90 * 86_400_000), id = receiptId();
-    const receipt = { receipt_id: id, created_at: created.toISOString(), expires_at: expires.toISOString(), server: { id: auth.session.server_id, slug: auth.session.server_slug }, requested_by: { principal_id: auth.session.principal_id, principal_type: auth.session.principal_type }, summary, results };
-    await env.DB.prepare("INSERT INTO receipts (id, server_id, principal_id, principal_type, created_at, expires_at, confirmed, contradicted, cant_check, body_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id, auth.session.server_id, auth.session.principal_id, auth.session.principal_type, receipt.created_at, receipt.expires_at, summary.confirmed, summary.contradicted, summary.cant_check, JSON.stringify(receipt)).run();
-    return json(receipt);
-  }
   // The design intentionally maps malformed and absent IDs to the same 404 as
   // unknown, expired, deleted, and other-server receipts.
   const limited = await reserveRead(env, auth.session);
@@ -254,10 +150,9 @@ export default {
     if (url.origin !== canonicalOrigin(env)) return error(404, "not_found", "No route matches this request.");
     if (url.pathname === MANIFEST_PATH && request.method === "GET") return json(manifest);
     if (url.pathname === CALLBACK_PATH && request.method === "GET") return callback(request, env);
-    const routes: Record<string, "get-session" | "get-receipt" | "check-claims"> = {
+    const routes: Record<string, "get-session" | "get-receipt"> = {
       "/api/agent/actions/get-session": "get-session",
       "/api/agent/actions/get-receipt": "get-receipt",
-      "/api/agent/actions/check-claims": "check-claims",
     };
     const route = routes[url.pathname];
     if (route && request.method === "POST") {

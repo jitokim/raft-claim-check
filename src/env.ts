@@ -4,7 +4,6 @@ export interface Env {
   RAFT_CLIENT_ID: string;
   RAFT_CLIENT_SECRET: string;
   SESSION_SECRET: string;
-  GITHUB_TOKEN: string;
 }
 
 export const CALLBACK_PATH = "/auth/agent/callback";
