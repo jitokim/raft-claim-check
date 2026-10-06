@@ -10,8 +10,7 @@ Prebuilt binaries for Linux and macOS (amd64, arm64) are on the [GitHub releases
 v=v2.0.0; f=claim-check_darwin_arm64   # or claim-check_{linux,darwin}_{amd64,arm64}
 curl -fsSLO "https://github.com/jitokim/raft-claim-check/releases/download/$v/$f"
 curl -fsSLO "https://github.com/jitokim/raft-claim-check/releases/download/$v/SHA256SUMS"
-grep " $f\$" SHA256SUMS | shasum -a 256 -c -   # or sha256sum -c -
-chmod +x "$f" && mv "$f" ~/.local/bin/claim-check
+grep " $f\$" SHA256SUMS | shasum -a 256 -c - && chmod +x "$f" && mkdir -p ~/.local/bin && mv "$f" ~/.local/bin/claim-check   # or sha256sum -c -
 ```
 
 To build from source, the CLI needs Go 1.25 to build and has no dependencies outside the standard library. At run time it needs the Raft CLI (`raft`, with Agent Login) on `PATH`, and `git` for the git fields.
