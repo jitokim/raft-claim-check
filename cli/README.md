@@ -7,7 +7,7 @@
 Prebuilt binaries for Linux and macOS (amd64, arm64) are on the [GitHub releases page](https://github.com/jitokim/raft-claim-check/releases). Check the download against the release's `SHA256SUMS` before you run it:
 
 ```bash
-v=v2.0.0; f=claim-check_darwin_arm64   # or claim-check_{linux,darwin}_{amd64,arm64}
+v=v2.0.1; f=claim-check_darwin_arm64   # or claim-check_{linux,darwin}_{amd64,arm64}
 curl -fsSLO "https://github.com/jitokim/raft-claim-check/releases/download/$v/$f"
 curl -fsSLO "https://github.com/jitokim/raft-claim-check/releases/download/$v/SHA256SUMS"
 grep " $f\$" SHA256SUMS | shasum -a 256 -c - && chmod +x "$f" && mkdir -p ~/.local/bin && mv "$f" ~/.local/bin/claim-check   # or sha256sum -c -
