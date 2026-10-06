@@ -133,7 +133,7 @@ When the submit fails:
 | Offline, timeout, `429`, `5xx` | Keep in spool. `flush` retries, respecting `Retry-After`. |
 | `400`, `403`, `409`, `413` (the app refused this receipt for good) | Move to `spool/rejected/` with the `{error, hint}`. Never retried automatically. |
 
-`flush` sends pending receipts oldest first and stops at the first `401` or `429`. A spooled receipt older than 7 days cannot be accepted (see [Verification](#verification)), so `flush` moves it to `rejected/`. Rejected files are deleted after 30 days.
+`flush` sends pending receipts oldest first and stops at the first `401`, `429` or other `4xx` without a known app error code (a Raft-side refusal such as a missing scope would fail every later receipt too). A spooled receipt older than 7 days cannot be accepted (see [Verification](#verification)), so `flush` moves it to `rejected/`. Rejected files are deleted after 30 days.
 
 ## Receipt schema
 
