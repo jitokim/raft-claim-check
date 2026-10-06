@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/jitokim/raft-claim-check/cli/internal/receipt"
+	"github.com/jitokim/raft-claim-check/cli/internal/redact"
 )
 
 // Timeout bounds each git call.
@@ -49,6 +50,21 @@ func Collect(dir string) Info {
 	// If status cannot be read, the tree cannot be claimed clean.
 	g.Dirty = !ok || len(bytes.TrimSpace(status)) > 0
 	return Info{Git: g, Root: root}
+}
+
+// MaskHome returns i with home replaced by "~" in git.remote_url (see
+// redact.MaskHome), which Collect has already passed through StripUserinfo.
+// It covers a plain path and a file:// URL alike. Root is left unchanged,
+// and i itself is not modified.
+func (i Info) MaskHome(home string) Info {
+	if i.Git == nil || i.Git.RemoteURL == nil {
+		return i
+	}
+	g := *i.Git
+	remote := redact.MaskHome(*g.RemoteURL, home)
+	g.RemoteURL = &remote
+	i.Git = &g
+	return i
 }
 
 // RelDir returns dir relative to the repository root ("." at the root), or
