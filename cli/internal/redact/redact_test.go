@@ -154,3 +154,113 @@ func TestArgv(t *testing.T) {
 		})
 	}
 }
+
+func TestMaskHome(t *testing.T) {
+	cases := []struct {
+		name, in, home, want string
+	}{
+		{"path under home", "/Users/bob/x", "/Users/bob", "~/x"},
+		{"home alone", "/Users/bob", "/Users/bob", "~"},
+		{"longer segment", "/Users/bobby/x", "/Users/bob", "/Users/bobby/x"},
+		{"dot suffix", "/Users/bob.old", "/Users/bob", "/Users/bob.old"},
+		{"dash and underscore suffix", "/Users/bob-2 /Users/bob_x", "/Users/bob", "/Users/bob-2 /Users/bob_x"},
+		{"non-ASCII suffix", "/Users/bobé/x", "/Users/bob", "/Users/bobé/x"},
+		{"semicolon", "cd /Users/bob; ls", "/Users/bob", "cd ~; ls"},
+		{"file url", "file:///Users/bob/x.git", "/Users/bob", "file://~/x.git"},
+		{"trailing-slash home", "/Users/bob/x and /Users/bob", "/Users/bob/", "~/x and ~"},
+		{"trailing-slash home boundary", "/Users/bobby/x", "/Users/bob/", "/Users/bobby/x"},
+		{"several occurrences", "a=/Users/bob:/Users/bob/bin,'/Users/bob'\t\"/Users/bob\"\n(/Users/bob)",
+			"/Users/bob", "a=~:~/bin,'~'\t\"~\"\n(~)"},
+		{"masked after a skipped one", "/Users/bobby /Users/bob", "/Users/bob", "/Users/bobby ~"},
+		{"other boundaries", "[/Users/bob]{/Users/bob}</Users/bob>|/Users/bob&`/Users/bob`", "/Users/bob",
+			"[~]{~}<~>|~&`~`"},
+		{"empty home", "/Users/bob/x", "", "/Users/bob/x"},
+		{"root home", "/Users/bob/x", "/", "/Users/bob/x"},
+		{"no occurrence", "nothing here", "/Users/bob", "nothing here"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := MaskHome(c.in, c.home); got != c.want {
+				t.Fatalf("MaskHome(%q, %q)\n got %q\nwant %q", c.in, c.home, got, c.want)
+			}
+		})
+	}
+}
+
+func TestWithHomeLeavesOriginalUnchanged(t *testing.T) {
+	r := New(nil)
+	_ = r.WithHome("/Users/bob")
+	if tail, _, n := r.Tail([]byte("/Users/bob/x"), false); tail != "/Users/bob/x" || n != 0 {
+		t.Fatalf("tail %q n %d", tail, n)
+	}
+}
+
+func TestTailMasksHome(t *testing.T) {
+	r := New(nil).WithHome("/Users/bob/")
+	tail, trunc, n := r.Tail([]byte("open /Users/bob/a\n\x1b[1m/Users/bob\x1b[0m /Users/bobby\n"), false)
+	if tail != "open ~/a\n~ /Users/bobby\n" || trunc || n != 2 {
+		t.Fatalf("tail %q trunc %v n %d", tail, trunc, n)
+	}
+	// Home masks and rule masks are both counted.
+	tail, _, n = r.Tail([]byte("/Users/bob/k "+ghp+" /Users/bob"), false)
+	if tail != "~/k [REDACTED:known_token] ~" || n != 3 {
+		t.Fatalf("tail %q n %d", tail, n)
+	}
+	// A home mask inside a rule mask is not counted on its own.
+	tail, _, n = r.Tail([]byte("DB_PASSWORD=/Users/bob/pw end"), false)
+	if tail != "DB_PASSWORD=[REDACTED:sensitive_assignment] end" || n != 1 {
+		t.Fatalf("tail %q n %d", tail, n)
+	}
+	// No home: unchanged behaviour.
+	tail, _, n = New(nil).Tail([]byte("/Users/bob/a"), false)
+	if tail != "/Users/bob/a" || n != 0 {
+		t.Fatalf("tail %q n %d", tail, n)
+	}
+}
+
+func TestTailMasksHomeBeforeCap(t *testing.T) {
+	r := New(nil).WithHome("/Users/bob")
+	// Unmasked, the window is 2 bytes over the cap and the cut would fall
+	// inside the home path; masked, it fits whole.
+	pad := strings.Repeat("y", TailBytes-len("/Users/bob/x")+2)
+	window := "/Users/bob/x" + pad
+	tail, trunc, n := r.Tail([]byte(window), false)
+	if tail != "~/x"+pad || trunc || n != 1 {
+		t.Fatalf("tail prefix %q trunc %v n %d len %d", tail[:10], trunc, n, len(tail))
+	}
+	// A home mask cut off by the cap is not counted; the kept one is.
+	window = "/Users/bob/old\n" + strings.Repeat("z", TailBytes) + " /Users/bob"
+	tail, trunc, n = r.Tail([]byte(window), false)
+	if !strings.HasSuffix(tail, "z ~") || strings.Contains(tail, "old") || !trunc || n != 1 || len(tail) != TailBytes {
+		t.Fatalf("tail suffix %q trunc %v n %d len %d", tail[len(tail)-10:], trunc, n, len(tail))
+	}
+}
+
+func TestArgvMasksHome(t *testing.T) {
+	r := New([]string{"SERVICE_PASSWORD=env-only-secret"}).WithHome("/Users/bob")
+	cases := []struct {
+		name   string
+		in     []string
+		idx    []int
+		want   []string
+		masked int
+	}{
+		{"home paths", []string{"/Users/bob/bin/tool", "--out=/Users/bob/o", "/Users/bobby/x"}, nil,
+			[]string{"~/bin/tool", "--out=~/o", "/Users/bobby/x"}, 2},
+		{"home and rule in one element counted once", []string{"cp", "/Users/bob/env-only-secret"}, nil,
+			[]string{"cp", "~/[REDACTED:env_value]"}, 1},
+		{"sensitive flag with home value", []string{"tool", "--token=/Users/bob/t"}, nil,
+			[]string{"tool", "--token=[REDACTED:sensitive_flag]"}, 1},
+		{"redact-arg wins", []string{"tool", "/Users/bob/s"}, []int{1},
+			[]string{"tool", "[REDACTED:redact_arg]"}, 1},
+		{"nothing to mask", []string{"go", "test", "./..."}, nil, []string{"go", "test", "./..."}, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, n := r.Argv(c.in, c.idx)
+			if strings.Join(got, "\x00") != strings.Join(c.want, "\x00") || n != c.masked {
+				t.Fatalf("Argv(%q) = %q, %d; want %q, %d", c.in, got, n, c.want, c.masked)
+			}
+		})
+	}
+}
