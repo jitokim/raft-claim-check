@@ -41,8 +41,15 @@ function decodeUtf8(bytes: Uint8Array): string {
   catch { throw new JsonError("invalid_utf8", "The body is not valid UTF-8."); }
 }
 
-/** Parses RFC 8259 JSON, rejecting duplicate keys, non-integer or out-of-range numbers, -0 and lone surrogates. */
-export function parseJson(input: string | Uint8Array): JsonValue {
+/** A number outside the integer-only domain, found at `path` (for example `receipt.payload.run.argv[0]`). */
+export interface NumberIssue { path: string; code: "non_integer" | "out_of_range" | "negative_zero" }
+
+/**
+ * Parses RFC 8259 JSON, rejecting duplicate keys, non-integer or out-of-range numbers, -0 and lone surrogates.
+ * When `numberIssues` is given, number-domain violations are recorded there with their path instead of thrown,
+ * and the number is returned as JavaScript parses it; everything else is still rejected.
+ */
+export function parseJson(input: string | Uint8Array, numberIssues?: NumberIssue[]): JsonValue {
   const text = typeof input === "string" ? input : decodeUtf8(input);
   let pos = 0;
 
@@ -90,35 +97,43 @@ export function parseJson(input: string | Uint8Array): JsonValue {
     return out;
   };
 
-  const parseNumber = (): number => {
+  const numberIssue = (literal: string, isInteger: boolean): [NumberIssue["code"], string] | null => {
+    if (!isInteger) return ["non_integer", "Numbers must be integers without fraction or exponent"];
+    if (literal === "-0") return ["negative_zero", "-0 is not allowed"];
+    const magnitude = BigInt(literal.startsWith("-") ? literal.slice(1) : literal);
+    return magnitude > BigInt(MAX_INTEGER) ? ["out_of_range", "Integer is outside +/-2^53"] : null;
+  };
+
+  const parseNumber = (path: string): number => {
     NUMBER.lastIndex = pos;
     const match = NUMBER.exec(text);
     if (!match) return fail("syntax", "Invalid number");
-    if (match[1] !== undefined || match[2] !== undefined) fail("non_integer", "Numbers must be integers without fraction or exponent");
     const literal = match[0];
-    if (literal === "-0") fail("negative_zero", "-0 is not allowed");
-    const magnitude = BigInt(literal.startsWith("-") ? literal.slice(1) : literal);
-    if (magnitude > BigInt(MAX_INTEGER)) fail("out_of_range", "Integer is outside +/-2^53");
+    const issue = numberIssue(literal, match[1] === undefined && match[2] === undefined);
+    if (issue) {
+      if (!numberIssues) fail(issue[0], issue[1]);
+      else numberIssues.push({ path, code: issue[0] });
+    }
     pos += literal.length;
     return Number(literal);
   };
 
-  const parseValue = (depth: number): JsonValue => {
+  const parseValue = (depth: number, path: string): JsonValue => {
     skipWhitespace();
     const c = text[pos];
     if (c === "{" || c === "[") {
       if (depth >= MAX_DEPTH) fail("too_deep", "Nesting is too deep");
-      return c === "{" ? parseObject(depth + 1) : parseArray(depth + 1);
+      return c === "{" ? parseObject(depth + 1, path) : parseArray(depth + 1, path);
     }
     if (c === '"') return parseString();
-    if (c === "-" || (c !== undefined && c >= "0" && c <= "9")) return parseNumber();
+    if (c === "-" || (c !== undefined && c >= "0" && c <= "9")) return parseNumber(path);
     for (const [word, value] of [["true", true], ["false", false], ["null", null]] as const) {
       if (text.startsWith(word, pos)) { pos += word.length; return value; }
     }
     return fail("syntax", "Unexpected character");
   };
 
-  const parseObject = (depth: number): { [key: string]: JsonValue } => {
+  const parseObject = (depth: number, path: string): { [key: string]: JsonValue } => {
     pos++;
     const result: { [key: string]: JsonValue } = {};
     const seen = new Set<string>();
@@ -132,7 +147,8 @@ export function parseJson(input: string | Uint8Array): JsonValue {
       seen.add(key);
       expect(":");
       // defineProperty keeps keys such as "__proto__" as plain own properties.
-      Object.defineProperty(result, key, { value: parseValue(depth), enumerable: true, writable: true, configurable: true });
+      const value = parseValue(depth, path === "" ? key : `${path}.${key}`);
+      Object.defineProperty(result, key, { value, enumerable: true, writable: true, configurable: true });
       skipWhitespace();
       if (text[pos] === ",") { pos++; continue; }
       if (text[pos] === "}") { pos++; return result; }
@@ -140,13 +156,13 @@ export function parseJson(input: string | Uint8Array): JsonValue {
     }
   };
 
-  const parseArray = (depth: number): JsonValue[] => {
+  const parseArray = (depth: number, path: string): JsonValue[] => {
     pos++;
     const result: JsonValue[] = [];
     skipWhitespace();
     if (text[pos] === "]") { pos++; return result; }
     for (;;) {
-      result.push(parseValue(depth));
+      result.push(parseValue(depth, `${path}[${result.length}]`));
       skipWhitespace();
       if (text[pos] === ",") { pos++; continue; }
       if (text[pos] === "]") { pos++; return result; }
@@ -154,14 +170,20 @@ export function parseJson(input: string | Uint8Array): JsonValue {
     }
   };
 
-  const value = parseValue(0);
+  const value = parseValue(0, "");
   skipWhitespace();
   if (pos !== text.length) fail("syntax", "Unexpected trailing characters");
   return value;
 }
 
-/** RFC 8785 canonical JSON text. Rejects anything outside the integer-only JSON domain. */
-export function canonicalize(value: unknown): string {
+/**
+ * "integers": the v2 payload domain, integers within +/-2^53 only.
+ * "finite": any finite number, serialized as RFC 8785 section 3.2.2.3 does (ECMAScript Number-to-String, -0 as 0).
+ */
+export type NumberDomain = "integers" | "finite";
+
+/** RFC 8785 canonical JSON text. Rejects anything outside the JSON domain, and numbers outside `numbers`. */
+export function canonicalize(value: unknown, numbers: NumberDomain = "integers"): string {
   if (value === null) return "null";
   if (value === true) return "true";
   if (value === false) return "false";
@@ -170,24 +192,28 @@ export function canonicalize(value: unknown): string {
     return JSON.stringify(value);
   }
   if (typeof value === "number") {
+    if (numbers === "finite") {
+      if (!Number.isFinite(value)) throw new JsonError("out_of_range", "Only finite numbers can be canonicalized.");
+      return Object.is(value, -0) ? "0" : String(value);
+    }
     if (!Number.isInteger(value)) throw new JsonError("non_integer", "Only integers can be canonicalized.");
     if (Object.is(value, -0)) throw new JsonError("negative_zero", "-0 cannot be canonicalized.");
     if (Math.abs(value) > MAX_INTEGER) throw new JsonError("out_of_range", "Integer is outside +/-2^53.");
     return String(value);
   }
-  if (Array.isArray(value)) return `[${Array.from(value, (item) => canonicalize(item)).join(",")}]`;
+  if (Array.isArray(value)) return `[${Array.from(value, (item) => canonicalize(item, numbers)).join(",")}]`;
   if (typeof value === "object") {
     const prototype = Object.getPrototypeOf(value);
     if (prototype !== Object.prototype && prototype !== null) throw new JsonError("unsupported_value", "Only plain objects can be canonicalized.");
     const record = value as Record<string, unknown>;
     // Array.prototype.sort without a comparator orders strings by UTF-16 code units, as RFC 8785 requires.
-    const members = Object.keys(record).sort().map((key) => `${canonicalize(key)}:${canonicalize(record[key])}`);
+    const members = Object.keys(record).sort().map((key) => `${canonicalize(key)}:${canonicalize(record[key], numbers)}`);
     return `{${members.join(",")}}`;
   }
   throw new JsonError("unsupported_value", `A ${typeof value} cannot be canonicalized.`);
 }
 
-/** UTF-8 bytes of canonicalize(value). */
-export function canonicalBytes(value: unknown): Uint8Array {
-  return new TextEncoder().encode(canonicalize(value));
+/** UTF-8 bytes of canonicalize(value, numbers). */
+export function canonicalBytes(value: unknown, numbers: NumberDomain = "integers"): Uint8Array {
+  return new TextEncoder().encode(canonicalize(value, numbers));
 }

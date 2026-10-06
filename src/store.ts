@@ -36,6 +36,31 @@ export interface Revocation {
   compromisedSince: string | null;
 }
 
+/** A row of the v2 receipts table. Times are RFC 3339 UTC with milliseconds. */
+export interface ReceiptRow {
+  id: string;
+  server_id: string;
+  principal_id: string;
+  principal_type: string;
+  key_id: string;
+  kind: "run" | "attest";
+  signed_at: string;
+  received_at: string;
+  expires_at: string;
+  envelope_json: string;
+  ledger_json: string;
+}
+
+/** A stored receipt as read back, joined with its key's current revocation state. */
+export interface StoredReceipt {
+  id: string;
+  envelope_json: string;
+  ledger_json: string;
+  received_at: string;
+  key_revoked_at: string | null;
+  key_compromised_since: string | null;
+}
+
 export interface Store {
   /** One atomic conditional insert into rate_reservations; true only if every window had room and the row was stored. */
   reserve(reservation: Reservation, windows: readonly RateWindow[]): Promise<boolean>;
@@ -51,6 +76,12 @@ export interface Store {
   listKeys(serverId: string, principalId: string): Promise<KeyRow[]>;
   /** Revokes the key only if it is bound to this server and principal and not yet revoked; true if it changed. */
   revokeKey(revocation: Revocation): Promise<boolean>;
+  /** The key only if it is bound to exactly this server and principal, revoked or not. */
+  getBoundKey(keyId: string, serverId: string, principalId: string): Promise<KeyRow | null>;
+  /** INSERT ... ON CONFLICT(id) DO NOTHING; true only if this call stored the row. */
+  insertReceipt(receipt: ReceiptRow): Promise<boolean>;
+  /** One query: the receipt with this ID on this server, unexpired at `now` (RFC 3339), joined with its key's current state. */
+  readReceipt(id: string, serverId: string, now: string): Promise<StoredReceipt | null>;
 }
 
 const KEY_COLUMNS = "key_id, public_key, server_id, principal_id, principal_type, label, registered_at, revoked_at, revoked_reason, compromised_since";
@@ -104,6 +135,26 @@ export class D1Store implements Store {
       "UPDATE keys SET revoked_at = ?, revoked_reason = ?, compromised_since = ? WHERE key_id = ? AND server_id = ? AND principal_id = ? AND revoked_at IS NULL",
     ).bind(revocation.revokedAt, revocation.reason, revocation.compromisedSince, revocation.keyId, revocation.serverId, revocation.principalId).run();
     return result.meta.changes === 1;
+  }
+
+  async getBoundKey(keyId: string, serverId: string, principalId: string): Promise<KeyRow | null> {
+    return this.db.prepare(`SELECT ${KEY_COLUMNS} FROM keys WHERE key_id = ? AND server_id = ? AND principal_id = ?`).bind(keyId, serverId, principalId).first<KeyRow>();
+  }
+
+  async insertReceipt(receipt: ReceiptRow): Promise<boolean> {
+    const result = await this.db.prepare(
+      "INSERT INTO receipts (id, server_id, principal_id, principal_type, key_id, kind, signed_at, received_at, expires_at, envelope_json, ledger_json) " +
+      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+    ).bind(receipt.id, receipt.server_id, receipt.principal_id, receipt.principal_type, receipt.key_id, receipt.kind, receipt.signed_at,
+      receipt.received_at, receipt.expires_at, receipt.envelope_json, receipt.ledger_json).run();
+    return result.meta.changes === 1;
+  }
+
+  async readReceipt(id: string, serverId: string, now: string): Promise<StoredReceipt | null> {
+    return this.db.prepare(
+      "SELECT r.id, r.envelope_json, r.ledger_json, r.received_at, k.revoked_at AS key_revoked_at, k.compromised_since AS key_compromised_since " +
+      "FROM receipts r JOIN keys k ON k.key_id = r.key_id WHERE r.id = ? AND r.server_id = ? AND r.expires_at > ?",
+    ).bind(id, serverId, now).first<StoredReceipt>();
   }
 }
 

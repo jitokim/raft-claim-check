@@ -1,11 +1,12 @@
 // In-memory fake of the Store port. test/store.test.ts runs the same contract against it and against D1Store.
-import type { KeyRow, NewKey, RateAction, RateWindow, Reservation, Revocation, Store, WindowUsage } from "../src/store";
+import type { KeyRow, NewKey, RateAction, RateWindow, ReceiptRow, Reservation, Revocation, Store, StoredReceipt, WindowUsage } from "../src/store";
 
 interface ReservationRow { serverId: string; principalId: string; action: RateAction; units: number; createdAt: number }
 
 export class MemoryStore implements Store {
   readonly reservations: ReservationRow[] = [];
   readonly keys: KeyRow[] = [];
+  readonly receipts: ReceiptRow[] = [];
 
   private inWindow(reservation: Reservation, window: RateWindow): ReservationRow[] {
     return this.reservations.filter((row) =>
@@ -56,5 +57,26 @@ export class MemoryStore implements Store {
     row.revoked_reason = revocation.reason;
     row.compromised_since = revocation.compromisedSince;
     return true;
+  }
+
+  async getBoundKey(keyId: string, serverId: string, principalId: string): Promise<KeyRow | null> {
+    const row = this.keys.find((key) => key.key_id === keyId && key.server_id === serverId && key.principal_id === principalId);
+    return row ? { ...row } : null;
+  }
+
+  async insertReceipt(receipt: ReceiptRow): Promise<boolean> {
+    if (this.receipts.some((row) => row.id === receipt.id)) return false;
+    this.receipts.push({ ...receipt });
+    return true;
+  }
+
+  async readReceipt(id: string, serverId: string, now: string): Promise<StoredReceipt | null> {
+    const row = this.receipts.find((receipt) => receipt.id === id && receipt.server_id === serverId && receipt.expires_at > now);
+    const key = row && this.keys.find((candidate) => candidate.key_id === row.key_id);
+    if (!row || !key) return null;
+    return {
+      id: row.id, envelope_json: row.envelope_json, ledger_json: row.ledger_json, received_at: row.received_at,
+      key_revoked_at: key.revoked_at, key_compromised_since: key.compromised_since,
+    };
   }
 }

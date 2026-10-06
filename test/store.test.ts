@@ -1,6 +1,6 @@
 // One contract for the Store port, run against the in-memory fake and against D1Store on the real migrations.
 import { describe, it, expect } from "vitest";
-import { D1Store, type NewKey, type RateWindow, type Reservation, type Store } from "../src/store";
+import { D1Store, type NewKey, type RateWindow, type ReceiptRow, type Reservation, type Store } from "../src/store";
 import { MemoryStore } from "./memory-store";
 import { migratedDatabase } from "./sqlite-d1";
 
@@ -112,6 +112,51 @@ describe.each(implementations)("%s", (_name, makeStore) => {
       expect(await store.revokeKey(revocation)).toBe(true);
       expect(await store.revokeKey({ ...revocation, revokedAt: "2026-10-06T11:00:00.000Z", reason: "lost", compromisedSince: null })).toBe(false);
       expect(await store.getKey(key.key_id)).toMatchObject({ revoked_at: "2026-10-06T10:00:00.000Z", revoked_reason: "compromised", compromised_since: key.registered_at });
+    });
+
+    it("getBoundKey finds a key only under its own server and principal, revoked or not", async () => {
+      const store = makeStore();
+      const key = newKey();
+      await store.insertKey(key, 5);
+      expect(await store.getBoundKey(key.key_id, "srv_a", "agent_a")).toEqual({ ...key, revoked_at: null, revoked_reason: null, compromised_since: null });
+      expect(await store.getBoundKey(key.key_id, "srv_b", "agent_a")).toBeNull();
+      expect(await store.getBoundKey(key.key_id, "srv_a", "agent_b")).toBeNull();
+      await store.revokeKey({ keyId: key.key_id, serverId: "srv_a", principalId: "agent_a", revokedAt: "2026-10-06T10:00:00.000Z", reason: "lost", compromisedSince: null });
+      expect(await store.getBoundKey(key.key_id, "srv_a", "agent_a")).toMatchObject({ revoked_at: "2026-10-06T10:00:00.000Z" });
+    });
+  });
+
+  describe("receipts", () => {
+    const receiptRow = (key: NewKey, overrides: Partial<ReceiptRow> = {}): ReceiptRow => ({
+      id: `rcpt_${"a".repeat(26)}`, server_id: "srv_a", principal_id: "agent_a", principal_type: "agent", key_id: key.key_id, kind: "run",
+      signed_at: "2026-10-06T09:00:00.000Z", received_at: "2026-10-06T09:00:01.000Z", expires_at: "2027-01-04T09:00:01.000Z",
+      envelope_json: '{"payload":{},"signature":{}}', ledger_json: '{"key":{}}', ...overrides,
+    });
+
+    it("inserts once per ID and reads back with the key's live state", async () => {
+      const store = makeStore();
+      const key = newKey();
+      await store.insertKey(key, 5);
+      const row = receiptRow(key);
+      expect(await store.insertReceipt(row)).toBe(true);
+      expect(await store.insertReceipt({ ...row, ledger_json: '{"other":true}' })).toBe(false);
+      const stored = { id: row.id, envelope_json: row.envelope_json, ledger_json: row.ledger_json, received_at: row.received_at };
+      expect(await store.readReceipt(row.id, "srv_a", "2026-10-06T10:00:00.000Z")).toEqual({ ...stored, key_revoked_at: null, key_compromised_since: null });
+      await store.revokeKey({ keyId: key.key_id, serverId: "srv_a", principalId: "agent_a", revokedAt: "2026-10-07T00:00:00.000Z", reason: "compromised", compromisedSince: key.registered_at });
+      expect(await store.readReceipt(row.id, "srv_a", "2026-10-07T10:00:00.000Z"))
+        .toEqual({ ...stored, key_revoked_at: "2026-10-07T00:00:00.000Z", key_compromised_since: key.registered_at });
+    });
+
+    it("reads only on the receipt's server and strictly before expires_at", async () => {
+      const store = makeStore();
+      const key = newKey();
+      await store.insertKey(key, 5);
+      const row = receiptRow(key);
+      await store.insertReceipt(row);
+      expect(await store.readReceipt(row.id, "srv_b", "2026-10-06T10:00:00.000Z")).toBeNull();
+      expect(await store.readReceipt(`rcpt_${"b".repeat(26)}`, "srv_a", "2026-10-06T10:00:00.000Z")).toBeNull();
+      expect(await store.readReceipt(row.id, "srv_a", "2027-01-04T09:00:00.999Z")).not.toBeNull();
+      expect(await store.readReceipt(row.id, "srv_a", row.expires_at)).toBeNull();
     });
   });
 });

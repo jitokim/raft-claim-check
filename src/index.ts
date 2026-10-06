@@ -5,6 +5,7 @@ import { CALLBACK_PATH, MANIFEST_PATH, SESSION_COOKIE, SESSION_SECONDS } from ".
 import { error, json, readBody } from "./http";
 import { listKeys, registerKey, revokeKey } from "./keys";
 import { reserve } from "./ratelimit";
+import { submitReceipt } from "./receipts";
 import { D1Store } from "./store";
 
 const canonicalOrigin = (env: Env) => env.CANONICAL_ORIGIN.replace(/\/$/, "");
@@ -151,14 +152,20 @@ export default {
       "/api/agent/actions/get-session": getSession,
       "/api/agent/actions/get-receipt": getReceipt(env.DB),
       "/api/agent/actions/register-key": registerKey,
+      "/api/agent/actions/submit-receipt": submitReceipt,
       "/api/agent/actions/list-keys": listKeys,
       "/api/agent/actions/revoke-key": revokeKey,
     };
     const route = routes[url.pathname];
     if (route && request.method === "POST") {
       try {
+        // Verification step 1 runs before the session check: an oversize body is refused without a cookie lookup.
         const body = await readBody(request);
-        if (!body) return error(400, "invalid_request", "Request body exceeds 64 KB.");
+        if (!body) {
+          return route === submitReceipt
+            ? error(413, "receipt_too_large", "The request body exceeds 64 KB.")
+            : error(400, "invalid_request", "Request body exceeds 64 KB.");
+        }
         const auth = await authenticate(request, env);
         if (!auth.session) return auth.response!;
         return await route({ store: new D1Store(env.DB), session: auth.session, now: Date.now() }, body);

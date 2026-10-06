@@ -3,7 +3,9 @@ import { createHmac } from "node:crypto";
 import { describe, it, expect } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/env";
-import { agentKey, registrationBody, statementFor } from "./helpers";
+import { receiptId } from "../src/crypto";
+import { canonicalize } from "../src/jcs";
+import { agentKey, receiptBody, registrationBody, runPayload, statementFor } from "./helpers";
 import { migratedDatabase } from "./sqlite-d1";
 
 const ORIGIN = "https://claim-check.ohmygraph.workers.dev";
@@ -99,6 +101,53 @@ describe("router", () => {
     expect(await listed.json()).toEqual({ keys: [record] });
     expect(sqlite.prepare("SELECT action, COUNT(*) AS n FROM rate_reservations GROUP BY action ORDER BY action").all().map((row) => ({ ...row })))
       .toEqual([{ action: "read", n: 1 }, { action: "register", n: 1 }, { action: "revoke", n: 1 }]);
+  });
+
+  it("submit_receipt step 1: over 64 KB is 413 receipt_too_large even with no cookie, so size runs before the session", async () => {
+    const { call } = setup();
+    for (const cookie of [null, `cc_session=${RAW_ID}`]) {
+      const response = await call("/api/agent/actions/submit-receipt", new Uint8Array(65_537), cookie);
+      expect(response.status).toBe(413);
+      expect(await response.json()).toEqual({ error: "receipt_too_large", hint: "The request body exceeds 64 KB." });
+    }
+    // Exactly 64 KB passes step 1 and stops at step 2 without a cookie.
+    expect((await call("/api/agent/actions/submit-receipt", `${" ".repeat(65_534)}{}`, null)).status).toBe(401);
+  });
+
+  it("submit_receipt steps 2 and 3: 401 without a session, 403 for a blocked server, before the body is parsed", async () => {
+    const { call, sqlite } = setup();
+    for (const cookie of [null, `cc_session=${"cd".repeat(32)}`]) {
+      const response = await call("/api/agent/actions/submit-receipt", "not json", cookie);
+      expect(response.status).toBe(401);
+      expect(await response.json()).toMatchObject({ error: "not_authenticated" });
+    }
+    sqlite.prepare("UPDATE sessions SET scopes = 'openid'").run();
+    expect((await call("/api/agent/actions/submit-receipt", "not json")).status).toBe(401);
+    sqlite.prepare("UPDATE sessions SET scopes = 'openid profile'").run();
+    sqlite.prepare("INSERT INTO blocked_servers (server_id, blocked_at, reason) VALUES ('srv_a', '2026-10-06T00:00:00.000Z', 'test')").run();
+    const blocked = await call("/api/agent/actions/submit-receipt", "not json");
+    expect(blocked.status).toBe(403);
+    expect(await blocked.json()).toMatchObject({ error: "not_authorized" });
+    expect(sqlite.prepare("SELECT COUNT(*) AS n FROM rate_reservations").get()).toEqual({ n: 0 });
+  });
+
+  it("submit_receipt end to end: 201 stored in D1 as JCS, 200 duplicate on resubmission", async () => {
+    const { call, sqlite } = setup();
+    const key = await agentKey();
+    const now = Date.now();
+    expect((await call("/api/agent/actions/register-key", await registrationBody(key, statementFor(key, { issued_at: new Date(now).toISOString() })))).status).toBe(201);
+    const payload = runPayload(key, { signed_at: new Date(now).toISOString() }, { started_at: new Date(now - 3000).toISOString(), finished_at: new Date(now - 10).toISOString() });
+    const body = await receiptBody(key, payload);
+    const created = await call("/api/agent/actions/submit-receipt", body);
+    expect(created.status).toBe(201);
+    const receipt = await created.json() as { receipt_id: string; envelope: unknown; duplicate: boolean };
+    expect(receipt.receipt_id).toBe(await receiptId(payload as never));
+    expect(receipt.duplicate).toBe(false);
+    expect(sqlite.prepare("SELECT id, key_id, kind, envelope_json FROM receipts").all().map((row) => ({ ...row })))
+      .toEqual([{ id: receipt.receipt_id, key_id: key.keyId, kind: "run", envelope_json: canonicalize(receipt.envelope) }]);
+    const again = await call("/api/agent/actions/submit-receipt", body);
+    expect(again.status).toBe(200);
+    expect(await again.json()).toMatchObject({ receipt_id: receipt.receipt_id, duplicate: true });
   });
 
   it("answers unknown routes and methods with 404", async () => {

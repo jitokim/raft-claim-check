@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { canonicalBytes, canonicalize, JsonError, parseJson } from "../src/jcs";
+import { canonicalBytes, canonicalize, JsonError, parseJson, type NumberIssue } from "../src/jcs";
 
 // U("20ac") is the six-character JSON escape backslash-u-2-0-a-c; ch() builds the decoded characters.
 // Escapes and non-ASCII characters are built in code so the source file stays plain ASCII.
@@ -106,6 +106,21 @@ describe("strict parsing", () => {
     expect(parseJson(`{"a":1,"${U("0062")}":2}`)).toEqual({ a: 1, b: 2 });
   });
 
+  it("records number-domain issues with their paths instead of throwing when asked to", () => {
+    const issues: NumberIssue[] = [];
+    const value = parseJson('{"a":{"b":[1,2.0,-0]},"c":9007199254740993,"d":1e3,"e":7}', issues);
+    expect(value).toEqual({ a: { b: [1, 2, -0] }, c: 9007199254740992, d: 1000, e: 7 });
+    expect(issues).toEqual([
+      { path: "a.b[1]", code: "non_integer" },
+      { path: "a.b[2]", code: "negative_zero" },
+      { path: "c", code: "out_of_range" },
+      { path: "d", code: "non_integer" },
+    ]);
+    // Everything else is still fatal in that mode.
+    expect(errorCode(() => parseJson('{"a":1.5,"a":2}', []))).toBe("duplicate_key");
+    expect(errorCode(() => parseJson("[1.5", []))).toBe("syntax");
+  });
+
   it("rejects the floats 1.0, 1e3 and 0.5", () => {
     for (const text of ["1.0", "1e3", "0.5", "[1.0]", '{"n":1e3}', '{"n":0.5}', "1E3", "1e-3", "-0.5"]) {
       expect(errorCode(() => parseJson(text)), text).toBe("non_integer");
@@ -166,6 +181,13 @@ describe("canonicalize", () => {
     expect(errorCode(() => canonicalize(undefined))).toBe("unsupported_value");
     expect(errorCode(() => canonicalize({ a: undefined }))).toBe("unsupported_value");
     expect(errorCode(() => canonicalize(new Date(0)))).toBe("unsupported_value");
+  });
+
+  it("in the finite domain, writes numbers as RFC 8785 does and still rejects non-finite ones", () => {
+    expect(canonicalize({ b: 1.5, a: [1e21, 1e-7, -0, 2 ** 60] }, "finite")).toBe('{"a":[1e+21,1e-7,0,1152921504606847000],"b":1.5}');
+    expect(errorCode(() => canonicalize(Number.POSITIVE_INFINITY, "finite"))).toBe("out_of_range");
+    expect(errorCode(() => canonicalize(Number.NaN, "finite"))).toBe("out_of_range");
+    expect(Buffer.from(canonicalBytes([0.5], "finite")).toString("utf8")).toBe("[0.5]");
   });
 
   it("sorts nested members and serializes strings as JSON.stringify does", () => {
