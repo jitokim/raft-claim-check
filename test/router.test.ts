@@ -3,6 +3,7 @@ import { createHmac } from "node:crypto";
 import { describe, it, expect } from "vitest";
 import worker from "../src/index";
 import type { Env } from "../src/env";
+import { agentKey, registrationBody, statementFor } from "./helpers";
 import { migratedDatabase } from "./sqlite-d1";
 
 const ORIGIN = "https://claim-check.ohmygraph.workers.dev";
@@ -68,6 +69,22 @@ describe("router", () => {
     expect(await limited.json()).toEqual({ error: "rate_limited", hint: "Read limit exceeded; retry after the indicated delay." });
     expect(sqlite.prepare("SELECT action, units, COUNT(*) AS n FROM rate_reservations GROUP BY action, units").all().map((row) => ({ ...row })))
       .toEqual([{ action: "read", units: 1, n: 120 }]);
+  });
+
+  it("register_key end to end: 201 stored in D1, 200 on repeat, oversize is 400 invalid_request", async () => {
+    const { call, sqlite } = setup();
+    const key = await agentKey();
+    const body = await registrationBody(key, statementFor(key, { issued_at: new Date().toISOString() }));
+    const created = await call("/api/agent/actions/register-key", body);
+    expect(created.status).toBe(201);
+    expect(await created.json()).toMatchObject({ key_id: key.keyId, status: "active", server: { id: "srv_a", slug: "a" }, principal: { id: "agent_a", type: "agent" } });
+    expect((await call("/api/agent/actions/register-key", body)).status).toBe(200);
+    expect(sqlite.prepare("SELECT key_id, server_id, principal_id, revoked_at FROM keys").all().map((row) => ({ ...row })))
+      .toEqual([{ key_id: key.keyId, server_id: "srv_a", principal_id: "agent_a", revoked_at: null }]);
+
+    const oversize = await call("/api/agent/actions/register-key", new Uint8Array(65_537));
+    expect(oversize.status).toBe(400);
+    expect(await oversize.json()).toEqual({ error: "invalid_request", hint: "Request body exceeds 64 KB." });
   });
 
   it("answers unknown routes and methods with 404", async () => {

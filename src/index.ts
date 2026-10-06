@@ -3,6 +3,7 @@ import type { ActionHandler, Session } from "./context";
 import type { Env } from "./env";
 import { CALLBACK_PATH, MANIFEST_PATH, SESSION_COOKIE, SESSION_SECONDS } from "./env";
 import { error, json, readBody } from "./http";
+import { registerKey } from "./keys";
 import { reserve } from "./ratelimit";
 import { D1Store } from "./store";
 
@@ -149,6 +150,7 @@ export default {
     const routes: Record<string, ActionHandler> = {
       "/api/agent/actions/get-session": getSession,
       "/api/agent/actions/get-receipt": getReceipt(env.DB),
+      "/api/agent/actions/register-key": registerKey,
     };
     const route = routes[url.pathname];
     if (route && request.method === "POST") {

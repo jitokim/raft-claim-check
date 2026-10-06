@@ -1,13 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { RATE_LIMITS, reserve } from "../src/ratelimit";
 import { D1Store, type RateAction, type Store } from "../src/store";
-import { session } from "./helpers";
+import { HOUR, MINUTE, session, T0 } from "./helpers";
 import { MemoryStore } from "./memory-store";
 import { migratedDatabase } from "./sqlite-d1";
-
-const T0 = Date.UTC(2026, 9, 6, 9, 0, 0);
-const MINUTE = 60_000;
-const HOUR = 3_600_000;
 
 it("uses the caps from docs/design-v2.md", () => {
   expect(RATE_LIMITS).toEqual({
