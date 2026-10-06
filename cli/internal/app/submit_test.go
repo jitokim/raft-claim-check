@@ -42,7 +42,8 @@ func TestSubmitFailureTable(t *testing.T) {
 		{"503 non-JSON", status(503, `"upstream"`), outKept, "503"},
 		{"400", status(400, `{"error":"schema_invalid","hint":"run.argv is too long"}`), outRejected, "400 schema_invalid"},
 		{"403", status(403, `{"error":"key_revoked","hint":"the key is revoked"}`), outRejected, "403 key_revoked"},
-		{"409", status(409, `{"error":"conflict","hint":"x"}`), outRejected, "409 conflict"},
+		{"409 unknown code", status(409, `{"error":"conflict","hint":"x"}`), outKept, "409 conflict without a known submit_receipt error, outcome unknown"},
+		{"400 without a body", status(400, ``), outKept, "kept in spool: 400 without a known submit_receipt error, outcome unknown; 'claim-check flush' retries it"},
 		{"413", status(413, `{"error":"receipt_too_large","hint":"x"}`), outRejected, "413 receipt_too_large"},
 		{"unexpected 404", status(404, `{"error":"nope"}`), outKept, "unexpected status 404"},
 	}
@@ -121,8 +122,16 @@ func TestSubmitInvokeFailedOutput(t *testing.T) {
 		{"429", failed(429, `{"error":"rate_limited","hint":"slow down"}`), outKept, "kept in spool: 429 rate_limited", nil},
 		{"500", failed(500, `{"error":"internal_error","hint":"x"}`), outKept, "kept in spool: 500 internal_error", nil},
 		{"no HTTP status", invokeFailed(raft.InvokeFailedCode, "service action failed: connection reset"), outKept, "outcome unknown", nil},
-		{"non-JSON body still uses the status", failed(403, `<html>Forbidden</html>`), outRejected, "rejected: 403 http_403",
-			map[string]any{"status": float64(403), "error": "http_403", "hint": ""}},
+		{"non-JSON body is kept", failed(403, `<html>Forbidden</html>`), outKept,
+			"kept in spool: 403 without a known submit_receipt error, outcome unknown; 'claim-check flush' retries it", nil},
+		{"Raft-side 403 with an error object", failed(403, `{"error":{"code":"INTEGRATION_INVOKE_FAILED","message":"missing scope"}}`), outKept,
+			"kept in spool: 403 without a known submit_receipt error, outcome unknown", nil},
+		{"Raft-side 403 with a string code", failed(403, `{"error":"INTEGRATION_INVOKE_FAILED","hint":"missing scope"}`), outKept,
+			"kept in spool: 403 INTEGRATION_INVOKE_FAILED without a known submit_receipt error, outcome unknown", nil},
+		{"400 unknown app code", failed(400, `{"error":"something_new","hint":"h"}`), outKept, "outcome unknown", nil},
+		{"400 schema_invalid", failed(400, `{"error":"schema_invalid","hint":"run.argv is too long"}`), outRejected,
+			"rejected: 400 schema_invalid: run.argv is too long",
+			map[string]any{"status": float64(400), "error": "schema_invalid", "hint": "run.argv is too long"}},
 		{"other error code with HTTP 403", invokeFailed("INTEGRATION_NOT_FOUND", `service action failed (HTTP 403); response body: {"error":"key_revoked","hint":"h"}`),
 			outKept, "submit outcome unknown", nil},
 	}
@@ -235,6 +244,36 @@ func TestFlushStopsOn401And429(t *testing.T) {
 				t.Fatalf("summary: %s", h.stderr.String())
 			}
 		})
+	}
+}
+
+// A 4xx without a known app error code is kept and counted as pending, and a
+// later flush retries and stores it.
+func TestFlushRetriesReceiptKeptOnUnknown4xx(t *testing.T) {
+	h := newHarness(t)
+	h.setupKey()
+	p := h.paths()
+	h.handlers["submit_receipt"] = invokeOutput(invokeFailed(raft.InvokeFailedCode,
+		`service action failed (HTTP 403); response body: {"error":{"code":"INTEGRATION_INVOKE_FAILED","message":"missing scope"}}`))
+	h.mustRun("run", "--", "true")
+	_, id := payloadOf(t, h.submitted()[0])
+	if code := h.run("flush"); code != 75 {
+		t.Fatalf("flush exit %d, want 75", code)
+	}
+	if !strings.Contains(h.stderr.String(), "0 stored, 0 rejected, 0 expired, 1 still pending") {
+		t.Fatalf("summary: %s", h.stderr.String())
+	}
+	if len(h.spoolFiles(p.SpoolDir)) != 1 || len(h.spoolFiles(p.RejectedDir)) != 0 {
+		t.Fatal("receipt not kept pending")
+	}
+	h.calls = nil
+	h.handlers["submit_receipt"] = acceptSubmit(201)
+	h.mustRun("flush")
+	if got := h.submittedIDs(); len(got) != 1 || got[0] != id {
+		t.Fatalf("submitted %v, want %s", got, id)
+	}
+	if len(h.spoolFiles(p.SpoolDir))+len(h.spoolFiles(p.RejectedDir)) != 0 {
+		t.Fatal("receipt not stored on the later flush")
 	}
 }
 

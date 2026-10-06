@@ -69,6 +69,16 @@ func TestKeyRegisterWithoutLabelSendsNull(t *testing.T) {
 	}
 }
 
+func TestKeyRegisterNonJSONRefusalShowsOnlyStatus(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("key", "init")
+	h.handlers["register_key"] = status(403, `<html>Forbidden</html>`)
+	code := h.run("key", "register")
+	if msg := h.stderr.String(); code != 1 || !strings.Contains(msg, "register_key: 403") || strings.Contains(msg, "http_") {
+		t.Fatalf("exit %d: %s", code, msg)
+	}
+}
+
 func TestKeyRegisterRefusedKeepsBindingNull(t *testing.T) {
 	h := newHarness(t)
 	h.mustRun("key", "init")

@@ -49,7 +49,8 @@ Every command except `verify` first runs `raft auth whoami`. If that fails, the 
 | `raft` missing or no `integration` command, not logged in, `401` | kept, with a hint. `flush` stops |
 | timeout, unparseable invoke output, `5xx`, any other status, or `200`/`201` without the matching `receipt_id` | kept. `flush` retries |
 | `429` | kept. `flush` stops |
-| `400`, `403`, `409`, `413` | moved to `spool/rejected/` with the app's `{error, hint}`. Never retried |
+| `400`, `403`, `409`, `413` with a known `submit_receipt` error code (`invalid_request`, `schema_unsupported`, `binding_mismatch`, `key_not_registered`, `key_revoked`, `bad_signature`, `schema_invalid`, `clock_skew`, `receipt_too_old`, `receipt_too_large`) | moved to `spool/rejected/` with the app's `{error, hint}`. Never retried |
+| `400`, `403`, `409`, `413` with no parseable `{error}` body or an unknown code (such as a Raft-side `INTEGRATION_INVOKE_FAILED`) | kept, outcome unknown. `flush` retries |
 
 ## Files
 

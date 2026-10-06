@@ -51,9 +51,8 @@ func (a *app) call(p *profile, action string, body []byte) (int, []byte, error) 
 	case status == 200 || status == 201:
 		return status, result, nil
 	}
-	ae := parseAppError(status, result)
-	msg := fmt.Sprintf("%s: %d %s", action, status, ae.Error)
-	if ae.Hint != "" {
+	msg := fmt.Sprintf("%s: %s", action, statusLine(status, result))
+	if ae, ok := parseAppError(result); ok && ae.Hint != "" {
 		msg += ": " + ae.Hint
 	}
 	switch {
