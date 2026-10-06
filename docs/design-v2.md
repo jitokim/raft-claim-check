@@ -96,16 +96,18 @@ The child must behave as if `claim-check` were not there:
 
 ### Where the key lives
 
-The key file **must** live under the per-agent profile HOME/XDG tree that `raft integration env --service claim-check` prints, never under the host user's global HOME. This is the credential red line in the Raft Manual, `integration` topic: a manifest-backed service's local credentials live under the per-agent profile tree.
+The key file lives in a per-agent directory that the CLI derives itself. `raft integration env --service claim-check` prints no profile folder for this app (its env is `{}`), so the CLI does not read its location from there. It runs `raft auth whoami` and takes `server_id` and `agent_id` from its output. The config directory is `${XDG_CONFIG_HOME:-$HOME/.config}/claim-check/<server_id>/<agent_id>/` and the state directory is the matching `${XDG_STATE_HOME:-$HOME/.local/state}/claim-check/<server_id>/<agent_id>/`. Two agents on one OS user therefore never share a key or a spool.
 
-The CLI resolves the tree by running `raft integration env --service claim-check` and reading `XDG_CONFIG_HOME` and `XDG_STATE_HOME` from its output, falling back to `<profile HOME>/.config` and `<profile HOME>/.local/state`. It never falls back to its own process's `HOME`. If the command fails or prints no profile HOME, every key command and `run` fail with exit `78` and a hint to run `raft integration login --service claim-check`.
+An XDG variable that is unset or relative is ignored and `$HOME` is used. If whoami fails, or neither the XDG variable nor `$HOME` is an absolute path, every key command and `run` fail with exit `78`; a whoami failure adds a hint to run `raft integration login --service claim-check`.
 
 | File | Path | Mode |
 | --- | --- | --- |
-| Private key (32-byte seed, raw) | `$XDG_CONFIG_HOME/claim-check/key/ed25519` | `0600`, directory `0700` |
-| Key metadata: `key_id`, public key, bound server and principal | `$XDG_CONFIG_HOME/claim-check/key/key.json` | `0600` |
-| Pending spool | `$XDG_STATE_HOME/claim-check/spool/<receipt_id>.json` | `0600`, directory `0700` |
-| Rejected spool | `$XDG_STATE_HOME/claim-check/spool/rejected/` | `0600` |
+| Private key (32-byte seed, raw) | `<config dir>/key/ed25519` | `0600` |
+| Key metadata: `key_id`, public key, bound server and principal | `<config dir>/key/key.json` | `0600` |
+| Pending spool | `<state dir>/spool/<receipt_id>.json` | `0600` |
+| Rejected spool | `<state dir>/spool/rejected/<receipt_id>.json` | `0600` |
+
+Every directory from `claim-check/` down is mode `0700`. The CLI creates them that way and tightens any that already exist.
 
 On every load, the CLI refuses a key file whose mode grants any group or other permission, as OpenSSH does.
 
@@ -135,7 +137,7 @@ When the submit fails:
 
 **Decision:** a receipt is an **envelope** holding a signed `payload` and a detached `signature`. The signature covers the **RFC 8785 JSON Canonicalization Scheme (JCS)** serialization of `payload`, encoded as UTF-8. **Rejected:** signing the bytes exactly as transmitted. The body passes through `raft integration invoke`, which parses and may re-serialize the JSON, so raw bytes are not guaranteed to survive. JCS gives Go and the Worker's JavaScript the same bytes from the same value. **Also rejected:** JWS or COSE, which add header and encoding layers that a reader cannot audit by eye.
 
-To keep JCS unambiguous, the payload contains **no floating-point numbers**. Every number is an integer within ±2^53. Payloads with duplicate object keys are rejected before canonicalization.
+To keep JCS unambiguous, the payload contains **no floating-point numbers**. Every number is an integer within ±2^53. Payloads with duplicate object keys are rejected before canonicalization. A payload containing `-0` is refused with `schema_invalid`, even though generic RFC 8785 serializes `-0` as `0`.
 
 **Schema version strings:** `claim-check.receipt.v2` for receipts and `claim-check.key-registration.v2` for registration statements. The `schema` field is inside the signed payload, so a signature over one kind can never pass as the other.
 
