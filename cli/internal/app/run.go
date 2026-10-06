@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/jitokim/raft-claim-check/cli/internal/gitinfo"
 	"github.com/jitokim/raft-claim-check/cli/internal/receipt"
@@ -118,7 +119,9 @@ func (a *app) cmdRun(args []string) int {
 	go func() {
 		defer close(done)
 		for s := range sigc {
-			_ = cmd.Process.Signal(s)
+			if forwardSignal(s, childPgrp(cmd.Process.Pid), syscall.Getpgrp(), foregroundPgrp()) {
+				_ = cmd.Process.Signal(s)
+			}
 		}
 	}()
 	_ = cmd.Wait() // a non-zero exit or a closed output is reported by ProcessState
@@ -159,6 +162,42 @@ func (a *app) cmdRun(args []string) int {
 		a.logf("%s", line) // write errors ignored: stderr may be closed
 	}
 	return result
+}
+
+// forwardSignal reports whether run passes sig on to the child. A Ctrl-C
+// at the terminal already sends SIGINT to every process in the foreground
+// process group, so SIGINT is not forwarded when the child shares the CLI's
+// group and that group is in the foreground. A group of -1 means unknown,
+// and every other case forwards.
+func forwardSignal(sig os.Signal, childPgrp, cliPgrp, foregroundPgrp int) bool {
+	if sig != syscall.SIGINT || childPgrp < 0 || foregroundPgrp < 0 {
+		return true
+	}
+	return !(childPgrp == cliPgrp && cliPgrp == foregroundPgrp)
+}
+
+// childPgrp returns the process group of pid, or -1 if it cannot be read.
+func childPgrp(pid int) int {
+	g, err := syscall.Getpgid(pid)
+	if err != nil {
+		return -1
+	}
+	return g
+}
+
+// foregroundPgrp returns the foreground process group of the controlling
+// terminal, or -1 if there is none or it cannot be read.
+func foregroundPgrp() int {
+	tty, err := os.Open("/dev/tty")
+	if err != nil {
+		return -1
+	}
+	defer tty.Close()
+	var pgrp int32
+	if _, _, errno := syscall.Syscall(syscall.SYS_IOCTL, tty.Fd(), uintptr(syscall.TIOCGPGRP), uintptr(unsafe.Pointer(&pgrp))); errno != 0 {
+		return -1
+	}
+	return int(pgrp)
 }
 
 // probe validates a provisional payload built from what is known before the
