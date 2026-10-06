@@ -5,6 +5,7 @@ import { describe, it, expect } from "vitest";
 import { keyId, parsePublicKey, parseSignature, receiptId, sha256, verifyEd25519 } from "../src/crypto";
 import { canonicalBytes, canonicalize, JsonError, parseJson, type JsonValue, type NumberIssue } from "../src/jcs";
 import { registerKey } from "../src/keys";
+import { validatePayload } from "../src/receipt-schema";
 import { encode, harness, session } from "./helpers";
 
 const VECTORS = new URL("../spec/vectors/", import.meta.url);
@@ -72,24 +73,45 @@ describe.each(receipts)("%s receipt_id", (_name, vector) => {
 });
 
 describe("jcs-cases.json", () => {
-  // Generic RFC 8785 cases are not v2 payloads, so they go through the Worker's RFC 8785 path: the parser recording
-  // number-domain issues instead of throwing, and the "finite" canonicalizer that step 9 of ## Verification signs over.
+  // The Worker's real JCS is submit_receipt's: step 4 parses recording number-domain issues instead of throwing, and
+  // step 9 signs over canonicalBytes(payload, "finite"). Number issues fail only at step 10, as schema_invalid.
+  const step9 = (input: string, issues: NumberIssue[]) => canonicalBytes(parseJson(input, issues), "finite");
+  const strictCode = (input: string) => {
+    try { canonicalize(parseJson(input)); } catch (cause) { return cause instanceof JsonError ? cause.code : String(cause); }
+    return undefined;
+  };
+
   it.each(cases.map((entry, index) => [index, entry] as const))("case %i", (_index, entry) => {
+    // No vector carries error today. One would be a rejection on the same path: a throw at step 4 or 9, else a number issue.
     if (entry.error !== undefined) {
+      const issues: NumberIssue[] = [];
       let code: string | undefined;
-      try { canonicalize(parseJson(entry.input)); } catch (cause) { code = cause instanceof JsonError ? cause.code : String(cause); }
-      expect(code).toBe(entry.error);
+      try { step9(entry.input, issues); } catch (cause) { code = cause instanceof JsonError ? cause.code : String(cause); }
+      expect(code ?? issues[0]?.code).toBe(entry.error);
       return;
     }
     const issues: NumberIssue[] = [];
-    expect(canonicalize(parseJson(entry.input, issues), "finite")).toBe(entry.output);
+    expect(Buffer.compare(Buffer.from(step9(entry.input, issues)), Buffer.from(entry.output, "utf8"))).toBe(0);
 
-    // The strict v2 payload parser (## Receipt schema: integers within +/-2^53 only) either agrees or refuses only
-    // for the number domain, never for anything else.
-    let strict: string | undefined, code: string | undefined;
-    try { strict = canonicalize(parseJson(entry.input)); } catch (cause) { code = cause instanceof JsonError ? cause.code : String(cause); }
-    if (code === undefined) expect(strict).toBe(entry.output);
+    // The strict integers-only path (register_key, receipt_id) either agrees or refuses only for a recorded number issue.
+    const code = strictCode(entry.input);
+    if (code === undefined) expect(canonicalize(parseJson(entry.input))).toBe(entry.output);
     else expect(issues.map((issue) => issue.code)).toContain(code);
+  });
+
+  it("case 10: -0 canonicalizes to 0 at step 9, and the strict path's negative_zero is step 10's schema_invalid", () => {
+    const entry = cases[10];
+    expect(entry.input).toBe("[9007199254740992,-9007199254740992,0,-0,1,-1]");
+    const issues: NumberIssue[] = [];
+    expect(new TextDecoder().decode(step9(entry.input, issues))).toBe(entry.output);
+    expect(issues).toEqual([{ path: "[3]", code: "negative_zero" }]);
+    expect(strictCode(entry.input)).toBe("negative_zero");
+
+    // Inside a submit_receipt body the same issue names the payload field, and validatePayload refuses it.
+    const bodyIssues: NumberIssue[] = [];
+    const body = parseJson(`{"receipt":{"payload":{"n":${entry.input}}}}`, bodyIssues) as { receipt: { payload: { [key: string]: JsonValue } } };
+    expect(bodyIssues).toEqual([{ path: "receipt.payload.n[3]", code: "negative_zero" }]);
+    expect(validatePayload(body.receipt.payload, bodyIssues)).toBe("payload.n[3] must be an integer within +/-2^53, without fraction, exponent or -0.");
   });
 });
 
