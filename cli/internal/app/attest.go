@@ -53,7 +53,7 @@ func (a *app) cmdAttest(args []string) int {
 	copy(sum[:], h.Sum(nil))
 	att := receipt.Attest{Path: f.recorded, SHA256: receipt.FormatHash(sum), Bytes: n, ObservedAt: receipt.FormatTime(a.Now())}
 
-	header := receipt.Header{KeyID: key.KeyID(), BoundTo: *meta.BoundTo, CLI: a.cliInfo(), Git: f.git.Git}
+	header := receipt.Header{KeyID: key.KeyID(), BoundTo: *meta.BoundTo, CLI: a.cliInfo(), Git: f.git.MaskHome(a.homeDir()).Git}
 	res, id, err := a.signAndSubmit(p, key, func(h receipt.Header) (receipt.Payload, error) {
 		return receipt.NewAttestPayload(h, att)
 	}, header)

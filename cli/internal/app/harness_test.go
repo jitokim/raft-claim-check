@@ -58,6 +58,8 @@ type harness struct {
 	out            io.Writer // replaces stdout when set
 	now            time.Time
 	cwd            string
+	home           string // returned by UserHomeDir, masked as "~"
+	homeErr        error  // returned by UserHomeDir when set
 }
 
 func newHarness(t *testing.T) *harness {
@@ -75,6 +77,7 @@ func newHarness(t *testing.T) *harness {
 		now:    time.Date(2026, 10, 6, 9, 0, 0, 0, time.UTC),
 		cwd:    filepath.Join(root, "work"),
 	}
+	h.home = h.env["HOME"]
 	if err := os.MkdirAll(h.cwd, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -142,9 +145,15 @@ func (h *harness) deps() Deps {
 			h.services = append(h.services, s)
 			return &fakeRaft{h: h, service: s, whoamiErr: h.whoamiErr}
 		},
-		Now:     func() time.Time { return h.now },
-		Rand:    rand.Reader,
-		Getwd:   func() (string, error) { return h.cwd, nil },
+		Now:   func() time.Time { return h.now },
+		Rand:  rand.Reader,
+		Getwd: func() (string, error) { return h.cwd, nil },
+		UserHomeDir: func() (string, error) {
+			if h.homeErr != nil {
+				return "", h.homeErr
+			}
+			return h.home, nil
+		},
 		Version: "2.0.0-test",
 	}
 }

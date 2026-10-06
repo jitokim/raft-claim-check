@@ -82,3 +82,35 @@ func TestStripUserinfo(t *testing.T) {
 		}
 	}
 }
+
+func TestInfoMaskHome(t *testing.T) {
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+	home := "/Users/alice"
+	for remote, want := range map[string]string{
+		"/Users/alice/x.git":                "~/x.git",
+		"/Users/alice/x.git/":               "~/x.git/",
+		"file:///Users/alice/x.git":         "file://~/x.git",
+		"file://user:pw@/Users/alice/x.git": "file://~/x.git",
+		"/Users/alicex/y.git":               "/Users/alicex/y.git",
+		"git@github.com:o/r.git":            "git@github.com:o/r.git",
+	} {
+		dir := t.TempDir()
+		gitT(t, dir, "init", "-q")
+		gitT(t, dir, "remote", "add", "origin", remote)
+		i := Collect(dir)
+		before := *i.Git.RemoteURL
+		m := i.MaskHome(home)
+		if got := *m.Git.RemoteURL; got != want {
+			t.Errorf("remote %q: remote_url = %q, want %q", remote, got, want)
+		}
+		if *i.Git.RemoteURL != before || m.Root != i.Root {
+			t.Errorf("remote %q: MaskHome changed the original Info or Root", remote)
+		}
+		if got := *i.MaskHome("").Git.RemoteURL; got != before {
+			t.Errorf("remote %q: empty home changed remote_url to %q", remote, got)
+		}
+	}
+	if m := (Info{}).MaskHome(home); m.Git != nil {
+		t.Fatalf("outside a repository: %+v", m)
+	}
+}

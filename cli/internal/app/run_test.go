@@ -369,3 +369,126 @@ func TestForwardSignal(t *testing.T) {
 		}
 	}
 }
+
+func gitIn(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+	cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v %s", args, err, out)
+	}
+}
+
+func TestRunMasksHomeInTailsKeepsRawHash(t *testing.T) {
+	h := newHarness(t)
+	h.setupKey()
+	home := h.home
+	h.mustRun("run", "--", "sh", "-c", `printf '%s/proj/a.txt\n%s/x\n%sby/y\n' "$1" "$1" "$1"; printf 'err %s\n' "$1" >&2`, "sh", home)
+	raw := home + "/proj/a.txt\n" + home + "/x\n" + home + "by/y\n"
+	if h.stdout.String() != raw {
+		t.Fatalf("the child's stdout was altered: %q", h.stdout.String())
+	}
+	p, _ := payloadOf(t, h.submitted()[0])
+	s := p.Run.Stdout
+	if s.SHA256 != receipt.HashBytes([]byte(raw)) || s.Bytes != int64(len(raw)) {
+		t.Fatalf("hash must cover the raw output: %s %d", s.SHA256, s.Bytes)
+	}
+	if want := "~/proj/a.txt\n~/x\n" + home + "by/y\n"; s.Tail != want || s.TailRedactions != 2 || s.TailTruncated {
+		t.Fatalf("stdout tail = %q (%d, truncated %v), want %q (2)", s.Tail, s.TailRedactions, s.TailTruncated, want)
+	}
+	rawErr := "err " + home + "\n"
+	e := p.Run.Stderr
+	if e.SHA256 != receipt.HashBytes([]byte(rawErr)) || e.Bytes != int64(len(rawErr)) || e.Tail != "err ~\n" || e.TailRedactions != 1 {
+		t.Fatalf("stderr = %+v", e)
+	}
+}
+
+func TestRunMasksHomeInArgv(t *testing.T) {
+	h := newHarness(t)
+	h.setupKey()
+	h.home = "/Users/bob"
+	token := "ghp_" + strings.Repeat("Q1w2", 9)
+	h.mustRun("run", "--", "echo", "/Users/bob/x", "/Users/bobby/y", "/Users/bob/k "+token, "file:///Users/bob/r.git", "plain")
+	if h.stdout.String() != "/Users/bob/x /Users/bobby/y /Users/bob/k "+token+" file:///Users/bob/r.git plain\n" {
+		t.Fatalf("the child must see the real argv: %q", h.stdout.String())
+	}
+	p, _ := payloadOf(t, h.submitted()[0])
+	want := []string{"echo", "~/x", "/Users/bobby/y", "~/k [REDACTED:known_token]", "file://~/r.git", "plain"}
+	if strings.Join(p.Run.Argv, "|") != strings.Join(want, "|") || p.Run.ArgvRedactions != 3 {
+		t.Fatalf("argv = %q (%d), want %q (3)", p.Run.Argv, p.Run.ArgvRedactions, want)
+	}
+}
+
+func TestRunProbeSeesHomeMaskedArgv(t *testing.T) {
+	h := newHarness(t)
+	h.setupKey()
+	h.home = "/" + strings.Repeat("h", 1000)
+	args := []string{"run", "--", "true"}
+	for i := 0; i < 9; i++ {
+		args = append(args, h.home+"/a")
+	}
+	// The raw argv is over the 8 KB cap; the masked argv is far under it.
+	h.mustRun(args...)
+	p, _ := payloadOf(t, h.submitted()[0])
+	if len(p.Run.Argv) != 10 || p.Run.Argv[1] != "~/a" || p.Run.ArgvRedactions != 9 {
+		t.Fatalf("argv = %q (%d)", p.Run.Argv, p.Run.ArgvRedactions)
+	}
+}
+
+func TestMasksHomeInRemoteURL(t *testing.T) {
+	for _, c := range []struct{ name, remote, want string }{
+		{"local path", "%s/repos/x.git", "~/repos/x.git"},
+		{"file URL", "file://%s/repos/x.git", "file://~/repos/x.git"},
+		{"lookalike prefix", "%sby/repos/x.git", "%sby/repos/x.git"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.setupKey()
+			gitInit(t, h.cwd)
+			gitIn(t, h.cwd, "remote", "add", "origin", strings.ReplaceAll(c.remote, "%s", h.home))
+			want := strings.ReplaceAll(c.want, "%s", h.home)
+			if err := os.WriteFile(filepath.Join(h.cwd, "a.txt"), []byte("a"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			h.mustRun("run", "--", "true")
+			h.mustRun("attest", "--file", "a.txt")
+			subs := h.submitted()
+			for i, kind := range []string{"run", "attest"} {
+				p, _ := payloadOf(t, subs[i])
+				if p.Git == nil || p.Git.RemoteURL == nil || *p.Git.RemoteURL != want {
+					t.Fatalf("%s: git = %+v, want remote_url %q", kind, p.Git, want)
+				}
+			}
+		})
+	}
+}
+
+func TestRunHomeEmptyOrUnreadableLeavesUnmasked(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		set  func(h *harness)
+	}{
+		{"empty home", func(h *harness) { h.home = "" }},
+		{"lookup fails", func(h *harness) { h.homeErr = fmt.Errorf("no home") }},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.setupKey()
+			home := h.home
+			c.set(h)
+			gitInit(t, h.cwd)
+			gitIn(t, h.cwd, "remote", "add", "origin", home+"/repos/x.git")
+			h.mustRun("run", "--", "echo", home+"/x")
+			p, _ := payloadOf(t, h.submitted()[0])
+			if p.Run.Argv[1] != home+"/x" || p.Run.ArgvRedactions != 0 {
+				t.Fatalf("argv = %q (%d)", p.Run.Argv, p.Run.ArgvRedactions)
+			}
+			if p.Run.Stdout.Tail != home+"/x\n" || p.Run.Stdout.TailRedactions != 0 {
+				t.Fatalf("tail = %q (%d)", p.Run.Stdout.Tail, p.Run.Stdout.TailRedactions)
+			}
+			if p.Git == nil || p.Git.RemoteURL == nil || *p.Git.RemoteURL != home+"/repos/x.git" {
+				t.Fatalf("git = %+v", p.Git)
+			}
+		})
+	}
+}

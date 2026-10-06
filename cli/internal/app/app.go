@@ -40,22 +40,24 @@ type Deps struct {
 	Now            func() time.Time
 	Rand           io.Reader
 	Getwd          func() (string, error)
+	UserHomeDir    func() (string, error) // masked as "~" before signing
 	Version        string
 }
 
 // DefaultDeps are the production dependencies.
 func DefaultDeps(version string) Deps {
 	return Deps{
-		Stdin:     os.Stdin,
-		Stdout:    os.Stdout,
-		Stderr:    os.Stderr,
-		LookupEnv: os.LookupEnv,
-		Environ:   os.Environ,
-		NewRaft:   func(s string) raft.Raft { return raft.New(s) },
-		Now:       time.Now,
-		Rand:      rand.Reader,
-		Getwd:     os.Getwd,
-		Version:   version,
+		Stdin:       os.Stdin,
+		Stdout:      os.Stdout,
+		Stderr:      os.Stderr,
+		LookupEnv:   os.LookupEnv,
+		Environ:     os.Environ,
+		NewRaft:     func(s string) raft.Raft { return raft.New(s) },
+		Now:         time.Now,
+		Rand:        rand.Reader,
+		Getwd:       os.Getwd,
+		UserHomeDir: os.UserHomeDir,
+		Version:     version,
 	}
 }
 
@@ -255,6 +257,19 @@ func (a *app) loadKey(p *profile, requireBinding bool) (*keystore.Key, keystore.
 		return nil, keystore.Meta{}, ExitConfig
 	}
 	return key, meta, 0
+}
+
+// homeDir returns the home directory to mask before signing, or "" (no
+// masking) if it cannot be read.
+func (a *app) homeDir() string {
+	if a.UserHomeDir == nil {
+		return ""
+	}
+	home, err := a.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return home
 }
 
 func (a *app) cliInfo() receipt.CLI {

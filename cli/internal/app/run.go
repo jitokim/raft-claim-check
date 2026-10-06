@@ -67,14 +67,15 @@ func (a *app) cmdRun(args []string) int {
 		return code
 	}
 
-	red := redact.New(a.Environ())
+	home := a.homeDir()
+	red := redact.New(a.Environ()).WithHome(home)
 	argv, argvRedactions := red.Argv(child, redactIdx)
 	cwd, err := a.Getwd()
 	if err != nil {
 		a.logf("cannot read the working directory: %v", err)
 		return ExitConfig
 	}
-	gi := gitinfo.Collect(cwd)
+	gi := gitinfo.Collect(cwd).MaskHome(home)
 	header := receipt.Header{KeyID: key.KeyID(), BoundTo: *meta.BoundTo, CLI: a.cliInfo(), Git: gi.Git}
 	rec := receipt.Run{Argv: argv, ArgvRedactions: int64(argvRedactions), CwdRel: gi.RelDir(cwd)}
 

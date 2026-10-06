@@ -95,6 +95,7 @@ var baseRules = []rule{
 // Redactor applies the rules. Build one per process with New.
 type Redactor struct {
 	rules []rule
+	home  string // masked by Tail and Argv; see WithHome
 }
 
 // New builds a Redactor. environ is the process environment as KEY=VALUE
@@ -118,6 +119,73 @@ func New(environ []string) *Redactor {
 		rules = append(rules, rule{RuleEnvValue, regexp.MustCompile(strings.Join(quoted, "|")), 0, nil})
 	}
 	return &Redactor{rules: rules}
+}
+
+// WithHome returns a copy of r whose Tail and Argv also replace home with
+// "~" (see MaskHome). The caller injects home; the Redactor never reads it
+// from the environment. An empty home disables the mask.
+func (r *Redactor) WithHome(home string) *Redactor {
+	c := *r
+	c.home = home
+	return &c
+}
+
+// MaskHome replaces each occurrence of home in s with "~" when it ends on a
+// path boundary: the end of s, '/', ASCII whitespace, a quote or one of
+// ":;,)]}>|&". Any other next byte continues a path segment, so "/Users/bob"
+// masks "/Users/bob/x" but not "/Users/bobby". It must also start s or follow
+// a byte outside [A-Za-z0-9._~-], so "/mnt/Users/bob" is left unchanged while
+// "x=/Users/bob" and "file:///Users/bob" are masked. One trailing '/' is
+// stripped from home first; an empty or root home leaves s unchanged. The caller
+// injects home; MaskHome never reads the environment.
+func MaskHome(s, home string) string {
+	out, _ := maskHome(s, home)
+	return out
+}
+
+// maskHome is MaskHome that also returns the byte offset in the result of
+// each "~" it wrote.
+func maskHome(s, home string) (string, []int) {
+	home = strings.TrimSuffix(home, "/")
+	if home == "" || home == "/" {
+		return s, nil
+	}
+	var b strings.Builder
+	var at []int
+	last := 0
+	for i := 0; i <= len(s)-len(home); {
+		j := strings.Index(s[i:], home)
+		if j < 0 {
+			break
+		}
+		start, end := i+j, i+j+len(home)
+		if start > 0 && isPathNameChar(s[start-1]) || end < len(s) && !isPathBoundary(s[end]) {
+			i = start + 1
+			continue
+		}
+		b.WriteString(s[last:start])
+		at = append(at, b.Len())
+		b.WriteByte('~')
+		last, i = end, end
+	}
+	if at == nil {
+		return s, nil
+	}
+	b.WriteString(s[last:])
+	return b.String(), at
+}
+
+// isPathBoundary reports whether c, the byte after a home occurrence, ends
+// the path segment.
+func isPathBoundary(c byte) bool {
+	return strings.IndexByte("/ \t\n\r\v\f'\"`:;,)]}>|&", c) >= 0
+}
+
+// isPathNameChar reports whether c, the byte before a home occurrence,
+// continues a longer path.
+func isPathNameChar(c byte) bool {
+	return 'A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || '0' <= c && c <= '9' ||
+		strings.IndexByte("._~-", c) >= 0
 }
 
 type span struct {
@@ -217,9 +285,11 @@ func Clean(raw []byte) string {
 
 // Tail turns a stream's scan window (its last bytes, at most WindowBytes)
 // into the recorded tail. droppedFront says whether the stream had bytes
-// before the window. It returns the tail (at most TailBytes, cut at a
-// character boundary and never inside a marker), whether anything was
-// dropped from the front, and the number of masks inside the tail.
+// before the window. The home mask (see WithHome) runs after Clean and
+// before the rules, and the cap applies to the masked text. It returns the
+// tail (at most TailBytes, cut at a character boundary and never inside a
+// marker), whether anything was dropped from the front, and the number of
+// masks inside the tail, home masks included.
 func (r *Redactor) Tail(window []byte, droppedFront bool) (tail string, truncated bool, redactions int) {
 	if droppedFront {
 		// Skip a character split by the window's start.
@@ -227,7 +297,8 @@ func (r *Redactor) Tail(window []byte, droppedFront bool) (tail string, truncate
 			window = window[1:]
 		}
 	}
-	res := r.Redact(Clean(window))
+	text, homes := maskHome(Clean(window), r.home)
+	res := r.Redact(text)
 	cut := 0
 	if len(res.Text) > TailBytes {
 		cut = len(res.Text) - TailBytes
@@ -245,7 +316,31 @@ func (r *Redactor) Tail(window []byte, droppedFront bool) (tail string, truncate
 			redactions++
 		}
 	}
+	for _, p := range homeOffsets(r.spans(text), homes) {
+		if p >= cut {
+			redactions++
+		}
+	}
 	return res.Text[cut:], droppedFront || cut > 0, redactions
+}
+
+// homeOffsets maps the offsets of home masks in the text given to Redact to
+// their offsets in its result. A home mask inside a span was replaced by the
+// span's marker and is dropped.
+func homeOffsets(spans []span, homes []int) []int {
+	var out []int
+	shift, k := 0, 0
+	for _, p := range homes {
+		for k < len(spans) && spans[k].end <= p {
+			shift += len(Marker(spans[k].rule)) - (spans[k].end - spans[k].start)
+			k++
+		}
+		if k < len(spans) && spans[k].start <= p {
+			continue
+		}
+		out = append(out, p+shift)
+	}
+	return out
 }
 
 var (
@@ -256,8 +351,9 @@ var (
 // Argv masks the child's argv. redactIdx are the --redact-arg indexes into
 // argv (counting from 0), masked in full. A flag whose name is sensitive has
 // its value masked in --name=value form and the next element masked in
-// --name value form. Every element also gets the text rules. The count is
-// the number of elements that were masked.
+// --name value form. Every element also gets the home mask (see WithHome)
+// and then the text rules. The count is the number of elements that were
+// masked, each counted once whatever masked it.
 func (r *Redactor) Argv(argv []string, redactIdx []int) ([]string, int) {
 	out := make([]string, len(argv))
 	count := 0
@@ -270,13 +366,14 @@ func (r *Redactor) Argv(argv []string, redactIdx []int) ([]string, int) {
 		case maskNext:
 			out[i] = Marker(RuleSensitiveFlag)
 		default:
-			if m := flagWithValue.FindStringSubmatch(a); m != nil && m[2] != "" && IsSensitiveName(m[1]) {
+			h, homes := maskHome(a, r.home)
+			if m := flagWithValue.FindStringSubmatch(h); m != nil && m[2] != "" && IsSensitiveName(m[1]) {
 				out[i] = m[1] + "=" + Marker(RuleSensitiveFlag)
 				break
 			}
 			var n int
-			out[i], n = r.Text(a)
-			masked = n > 0
+			out[i], n = r.Text(h)
+			masked = n > 0 || len(homes) > 0
 		}
 		maskNext = flagAlone.MatchString(a) && IsSensitiveName(a)
 		if masked {
