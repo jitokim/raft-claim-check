@@ -147,6 +147,16 @@ describe.each(implementations)("%s", (_name, makeStore) => {
         .toEqual({ ...stored, key_revoked_at: "2026-10-07T00:00:00.000Z", key_compromised_since: key.registered_at });
     });
 
+    it("refuses to insert, and stores nothing, once the bound key is revoked", async () => {
+      const store = makeStore();
+      const key = newKey();
+      await store.insertKey(key, 5);
+      await store.revokeKey({ keyId: key.key_id, serverId: "srv_a", principalId: "agent_a", revokedAt: "2026-10-06T08:59:00.000Z", reason: "lost", compromisedSince: null });
+      const row = receiptRow(key);
+      expect(await store.insertReceipt(row)).toBe(false);
+      expect(await store.readReceipt(row.id, "srv_a", "2026-10-06T10:00:00.000Z")).toBeNull();
+    });
+
     it("reads only on the receipt's server and strictly before expires_at", async () => {
       const store = makeStore();
       const key = newKey();

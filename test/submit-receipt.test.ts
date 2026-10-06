@@ -3,9 +3,11 @@ import { describe, it, expect } from "vitest";
 import { receiptId } from "../src/crypto";
 import { canonicalize } from "../src/jcs";
 import { submitReceipt } from "../src/receipts";
+import type { KeyRow } from "../src/store";
 import {
   agentKey, attestPayload, bindKey, DAY, encode, harness, iso, MINUTE, receiptBody, runPayload, session, T0, type AgentKey, type Statement,
 } from "./helpers";
+import { MemoryStore } from "./memory-store";
 
 const ESC = String.fromCharCode(0x1b);
 // Far enough ahead to fail the 5-minute clock_skew bound.
@@ -370,5 +372,78 @@ describe("submit_receipt", () => {
     const { key, submit } = await setup();
     const payload = runPayload(key, { bound_to: { server_id: "srv_a", principal_id: "agent_b" } });
     expectError(await submit(await receiptBody(key, payload), { session: session({ principal_id: "agent_b" }) }), 403, "key_not_registered");
+  });
+
+  describe("revoke_key racing submit_receipt", () => {
+    /** Returns the still-active key row from getBoundKey (step 8), then revokes the key, as if revoke_key committed during step 9. */
+    class RevokingStore extends MemoryStore {
+      revokeOnLookup = false;
+      override async getBoundKey(keyId: string, serverId: string, principalId: string): Promise<KeyRow | null> {
+        const row = await super.getBoundKey(keyId, serverId, principalId);
+        if (this.revokeOnLookup) {
+          expect(row?.revoked_at).toBeNull();
+          expect(await this.revokeKey({ keyId, serverId, principalId, revokedAt: iso(T0 - 1), reason: "lost", compromisedSince: null })).toBe(true);
+        }
+        return row;
+      }
+    }
+
+    async function raceSetup() {
+      const store = new RevokingStore();
+      const { call } = harness({ store });
+      const key = await agentKey();
+      await bindKey(store, key);
+      return { store, key, submit: (body: Uint8Array) => call(submitReceipt, body) };
+    }
+
+    const revoke = (store: MemoryStore, key: AgentKey) =>
+      store.revokeKey({ keyId: key.keyId, serverId: "srv_a", principalId: "agent_a", revokedAt: iso(T0 - MINUTE), reason: "lost", compromisedSince: null });
+
+    it("12. a key revoked between lookup and insert gives 403 key_revoked and stores nothing", async () => {
+      const { store, key, submit } = await raceSetup();
+      store.revokeOnLookup = true;
+      expectError(await submit(await receiptBody(key, runPayload(key))), 403, "key_revoked");
+      expect(store.keys[0].revoked_at).not.toBeNull();
+      expect(store.receipts).toHaveLength(0);
+    });
+
+    it("12. the same race for an already stored receipt returns 200 duplicate true with the stored receipt", async () => {
+      const { store, key, submit } = await raceSetup();
+      const body = await receiptBody(key, runPayload(key));
+      const first = await submit(body);
+      expect(first.status).toBe(201);
+      store.revokeOnLookup = true;
+      const again = await submit(body);
+      expect(store.keys[0].revoked_at).not.toBeNull();
+      expect(again.status).toBe(200);
+      const { duplicate: _created, ...stored } = first.body;
+      // The stored receipt is returned as is, except that ledger.key shows the key's current (revoked) status.
+      const ledger = stored.ledger as { key: Record<string, unknown> };
+      expect(again.body).toEqual({
+        ...stored, duplicate: true,
+        ledger: { ...ledger, key: { ...ledger.key, status: "revoked", revoked_at: store.keys[0].revoked_at } },
+      });
+      expect(store.receipts).toHaveLength(1);
+    });
+
+    it("8. resubmitting a stored receipt after its key was revoked returns 200 duplicate true", async () => {
+      const { store, key, submit } = await setup();
+      const body = await receiptBody(key, runPayload(key));
+      const first = await submit(body);
+      expect(first.status).toBe(201);
+      expect(await revoke(store, key)).toBe(true);
+      const again = await submit(body);
+      expect(again.status).toBe(200);
+      expect(again.body.duplicate).toBe(true);
+      expect(again.body.receipt_id).toBe(first.body.receipt_id);
+      expect(store.receipts).toHaveLength(1);
+    });
+
+    it("8. a first submit with an already revoked key gives 403 key_revoked and stores nothing", async () => {
+      const { store, key, submit } = await setup();
+      expect(await revoke(store, key)).toBe(true);
+      expectError(await submit(await receiptBody(key, runPayload(key))), 403, "key_revoked");
+      expect(store.receipts).toHaveLength(0);
+    });
   });
 });
