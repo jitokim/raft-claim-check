@@ -1,0 +1,58 @@
+[
+  {
+    "input": "{\"b\":2,\"a\":1,\"c\":3}",
+    "output": "{\"a\":1,\"b\":2,\"c\":3}"
+  },
+  {
+    "input": "{\"日本\":4,\"é\":1,\"z\":3,\"e\":2,\"A\":5}",
+    "output": "{\"A\":5,\"e\":2,\"z\":3,\"é\":1,\"日本\":4}"
+  },
+  {
+    "input": "{\"\\ufffd\":1,\"\\ud800\\udc00\":2}",
+    "output": "{\"𐀀\":2,\"�\":1}"
+  },
+  {
+    "input": "{\"\\u20ac\":\"Euro Sign\",\"\\r\":\"Carriage Return\",\"\\ufb33\":\"Hebrew Letter Dalet With Dagesh\",\"1\":\"One\",\"\\ud83d\\ude00\":\"Emoji: Grinning Face\",\"\\u0080\":\"Control\",\"\\u00f6\":\"Latin Small Letter O With Diaeresis\"}",
+    "output": "{\"\\r\":\"Carriage Return\",\"1\":\"One\",\"\":\"Control\",\"ö\":\"Latin Small Letter O With Diaeresis\",\"€\":\"Euro Sign\",\"😀\":\"Emoji: Grinning Face\",\"דּ\":\"Hebrew Letter Dalet With Dagesh\"}"
+  },
+  {
+    "input": "\"\\u0008\\u000c\\u000a\\u000d\\u0009\\u0022\\u005c\\/\"",
+    "output": "\"\\b\\f\\n\\r\\t\\\"\\\\/\""
+  },
+  {
+    "input": "\"\\u0000\\u0001\\u001F\\u001b\\u007f\"",
+    "output": "\"\\u0000\\u0001\\u001f\\u001b\""
+  },
+  {
+    "input": "\"\\u00e9\\u65E5\\ud83d\\ude00\\u2028<>&'\"",
+    "output": "\"é日😀\u2028<>&'\""
+  },
+  {
+    "input": "{\"a\\\"b\":2,\"a\\nb\":1}",
+    "output": "{\"a\\nb\":1,\"a\\\"b\":2}"
+  },
+  {
+    "input": "{\"z\":[3,{\"y\":true,\"x\":null}],\"a\":{\"c\":[[],[1,[2]]],\"b\":{\"k\":{\"j\":\"v\"}}}}",
+    "output": "{\"a\":{\"b\":{\"k\":{\"j\":\"v\"}},\"c\":[[],[1,[2]]]},\"z\":[3,{\"x\":null,\"y\":true}]}"
+  },
+  {
+    "input": "[ {}, [], \"\", {\"\":[]} ]",
+    "output": "[{},[],\"\",{\"\":[]}]"
+  },
+  {
+    "input": "[9007199254740992,-9007199254740992,0,-0,1,-1]",
+    "output": "[9007199254740992,-9007199254740992,0,0,1,-1]"
+  },
+  {
+    "input": " \t\r\n{ \"a\" : [ true , false , null ] }\n",
+    "output": "{\"a\":[true,false,null]}"
+  },
+  {
+    "input": "\"top\"",
+    "output": "\"top\""
+  },
+  {
+    "input": "123",
+    "output": "123"
+  }
+]

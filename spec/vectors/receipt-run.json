@@ -1,0 +1,120 @@
+{
+  "payload": {
+    "bound_to": {
+      "principal_id": "agent_test",
+      "server_id": "srv_test"
+    },
+    "cli": {
+      "arch": "amd64",
+      "name": "claim-check",
+      "os": "linux",
+      "version": "2.0.0-test"
+    },
+    "git": {
+      "branch": "main",
+      "dirty": false,
+      "head": "0123456789abcdef0123456789abcdef01234567",
+      "remote_url": "https://github.com/example/widgets.git"
+    },
+    "key_id": "ck_n6k2f752m56jhduskszg7jxtki",
+    "kind": "run",
+    "nonce": "AQEBAQEBAQEBAQEBAQEBAQ",
+    "run": {
+      "argv": [
+        "go",
+        "test",
+        "./...",
+        "-token=[REDACTED:sensitive_flag]"
+      ],
+      "argv_redactions": 1,
+      "cwd_rel": ".",
+      "duration_ms": 3030,
+      "exit": {
+        "code": 0,
+        "signal": null
+      },
+      "finished_at": "2026-10-06T09:00:03.050Z",
+      "started_at": "2026-10-06T09:00:00.020Z",
+      "stderr": {
+        "bytes": 55,
+        "sha256": "sha256:9a1ffa710647344833f331bdbe21fc800b16182b28c2f00bd737895fc896ff78",
+        "tail": "warning: \"quoted\" \\ backslash, tab\there, <html> & 😀\n",
+        "tail_redactions": 0,
+        "tail_truncated": false
+      },
+      "stdout": {
+        "bytes": 78,
+        "sha256": "sha256:f2f6219b1e1058ec7d2589141f195cfede771f8a47f80849c99cb2b5b9a92134",
+        "tail": "ok  \texample.com/widgets/api\t1.204s\nok  \texample.com/widgets/ünïcode\t0.811s\n",
+        "tail_redactions": 0,
+        "tail_truncated": false
+      }
+    },
+    "schema": "claim-check.receipt.v2",
+    "signed_at": "2026-10-06T09:00:03.120Z"
+  },
+  "jcs": "{\"bound_to\":{\"principal_id\":\"agent_test\",\"server_id\":\"srv_test\"},\"cli\":{\"arch\":\"amd64\",\"name\":\"claim-check\",\"os\":\"linux\",\"version\":\"2.0.0-test\"},\"git\":{\"branch\":\"main\",\"dirty\":false,\"head\":\"0123456789abcdef0123456789abcdef01234567\",\"remote_url\":\"https://github.com/example/widgets.git\"},\"key_id\":\"ck_n6k2f752m56jhduskszg7jxtki\",\"kind\":\"run\",\"nonce\":\"AQEBAQEBAQEBAQEBAQEBAQ\",\"run\":{\"argv\":[\"go\",\"test\",\"./...\",\"-token=[REDACTED:sensitive_flag]\"],\"argv_redactions\":1,\"cwd_rel\":\".\",\"duration_ms\":3030,\"exit\":{\"code\":0,\"signal\":null},\"finished_at\":\"2026-10-06T09:00:03.050Z\",\"started_at\":\"2026-10-06T09:00:00.020Z\",\"stderr\":{\"bytes\":55,\"sha256\":\"sha256:9a1ffa710647344833f331bdbe21fc800b16182b28c2f00bd737895fc896ff78\",\"tail\":\"warning: \\\"quoted\\\" \\\\ backslash, tab\\there, <html> & 😀\\n\",\"tail_redactions\":0,\"tail_truncated\":false},\"stdout\":{\"bytes\":78,\"sha256\":\"sha256:f2f6219b1e1058ec7d2589141f195cfede771f8a47f80849c99cb2b5b9a92134\",\"tail\":\"ok  \\texample.com/widgets/api\\t1.204s\\nok  \\texample.com/widgets/ünïcode\\t0.811s\\n\",\"tail_redactions\":0,\"tail_truncated\":false}},\"schema\":\"claim-check.receipt.v2\",\"signed_at\":\"2026-10-06T09:00:03.120Z\"}",
+  "sha256": "0d1e16bc124dbaa45649cae70bd9236498cf78fed373ae0d199575ec531753ad",
+  "envelope": {
+    "payload": {
+      "bound_to": {
+        "principal_id": "agent_test",
+        "server_id": "srv_test"
+      },
+      "cli": {
+        "arch": "amd64",
+        "name": "claim-check",
+        "os": "linux",
+        "version": "2.0.0-test"
+      },
+      "git": {
+        "branch": "main",
+        "dirty": false,
+        "head": "0123456789abcdef0123456789abcdef01234567",
+        "remote_url": "https://github.com/example/widgets.git"
+      },
+      "key_id": "ck_n6k2f752m56jhduskszg7jxtki",
+      "kind": "run",
+      "nonce": "AQEBAQEBAQEBAQEBAQEBAQ",
+      "run": {
+        "argv": [
+          "go",
+          "test",
+          "./...",
+          "-token=[REDACTED:sensitive_flag]"
+        ],
+        "argv_redactions": 1,
+        "cwd_rel": ".",
+        "duration_ms": 3030,
+        "exit": {
+          "code": 0,
+          "signal": null
+        },
+        "finished_at": "2026-10-06T09:00:03.050Z",
+        "started_at": "2026-10-06T09:00:00.020Z",
+        "stderr": {
+          "bytes": 55,
+          "sha256": "sha256:9a1ffa710647344833f331bdbe21fc800b16182b28c2f00bd737895fc896ff78",
+          "tail": "warning: \"quoted\" \\ backslash, tab\there, <html> & 😀\n",
+          "tail_redactions": 0,
+          "tail_truncated": false
+        },
+        "stdout": {
+          "bytes": 78,
+          "sha256": "sha256:f2f6219b1e1058ec7d2589141f195cfede771f8a47f80849c99cb2b5b9a92134",
+          "tail": "ok  \texample.com/widgets/api\t1.204s\nok  \texample.com/widgets/ünïcode\t0.811s\n",
+          "tail_redactions": 0,
+          "tail_truncated": false
+        }
+      },
+      "schema": "claim-check.receipt.v2",
+      "signed_at": "2026-10-06T09:00:03.120Z"
+    },
+    "signature": {
+      "alg": "ed25519",
+      "key_id": "ck_n6k2f752m56jhduskszg7jxtki",
+      "value": "ed25519:rwb4JOTLcV4mEBBtPtcOdbPEGdW9rwJqg6jBe6yLoCJc9m6a_0zm18qD0LOrUTkxatGc4dAi8rAVj7Gy8k1xDQ"
+    }
+  },
+  "receipt_id": "rcpt_bupbnpasjw5kivsjzltqxwjdmq"
+}

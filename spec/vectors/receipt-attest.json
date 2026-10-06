@@ -1,0 +1,70 @@
+{
+  "payload": {
+    "attest": {
+      "bytes": 40,
+      "observed_at": "2026-10-06T09:09:59.999Z",
+      "path": "dist/widgets-1.0.0.tar.gz",
+      "sha256": "sha256:ac78ececc30cc09560c3981425a27f027d12bbcffd33e7501e98e97f5b37e05a"
+    },
+    "bound_to": {
+      "principal_id": "agent_test",
+      "server_id": "srv_test"
+    },
+    "cli": {
+      "arch": "amd64",
+      "name": "claim-check",
+      "os": "linux",
+      "version": "2.0.0-test"
+    },
+    "git": {
+      "branch": "main",
+      "dirty": true,
+      "head": null,
+      "remote_url": null
+    },
+    "key_id": "ck_n6k2f752m56jhduskszg7jxtki",
+    "kind": "attest",
+    "nonce": "AgICAgICAgICAgICAgICAg",
+    "schema": "claim-check.receipt.v2",
+    "signed_at": "2026-10-06T09:10:00.500Z"
+  },
+  "jcs": "{\"attest\":{\"bytes\":40,\"observed_at\":\"2026-10-06T09:09:59.999Z\",\"path\":\"dist/widgets-1.0.0.tar.gz\",\"sha256\":\"sha256:ac78ececc30cc09560c3981425a27f027d12bbcffd33e7501e98e97f5b37e05a\"},\"bound_to\":{\"principal_id\":\"agent_test\",\"server_id\":\"srv_test\"},\"cli\":{\"arch\":\"amd64\",\"name\":\"claim-check\",\"os\":\"linux\",\"version\":\"2.0.0-test\"},\"git\":{\"branch\":\"main\",\"dirty\":true,\"head\":null,\"remote_url\":null},\"key_id\":\"ck_n6k2f752m56jhduskszg7jxtki\",\"kind\":\"attest\",\"nonce\":\"AgICAgICAgICAgICAgICAg\",\"schema\":\"claim-check.receipt.v2\",\"signed_at\":\"2026-10-06T09:10:00.500Z\"}",
+  "sha256": "5bd00e3114ae49b77ce2685bf8c9b1ccf19a7a459fe97df82050d238cdbeb4b9",
+  "envelope": {
+    "payload": {
+      "attest": {
+        "bytes": 40,
+        "observed_at": "2026-10-06T09:09:59.999Z",
+        "path": "dist/widgets-1.0.0.tar.gz",
+        "sha256": "sha256:ac78ececc30cc09560c3981425a27f027d12bbcffd33e7501e98e97f5b37e05a"
+      },
+      "bound_to": {
+        "principal_id": "agent_test",
+        "server_id": "srv_test"
+      },
+      "cli": {
+        "arch": "amd64",
+        "name": "claim-check",
+        "os": "linux",
+        "version": "2.0.0-test"
+      },
+      "git": {
+        "branch": "main",
+        "dirty": true,
+        "head": null,
+        "remote_url": null
+      },
+      "key_id": "ck_n6k2f752m56jhduskszg7jxtki",
+      "kind": "attest",
+      "nonce": "AgICAgICAgICAgICAgICAg",
+      "schema": "claim-check.receipt.v2",
+      "signed_at": "2026-10-06T09:10:00.500Z"
+    },
+    "signature": {
+      "alg": "ed25519",
+      "key_id": "ck_n6k2f752m56jhduskszg7jxtki",
+      "value": "ed25519:_zbqV-1EXDgBGqpFEqslxAEGRt6qwKPoUaItdLjM-iVndJElxGrkMeRVr78Mmo4-AjdCEeevGJ5JDR_wyaMMBw"
+    }
+  },
+  "receipt_id": "rcpt_lpia4miuvze3o7hcnbn7rsnrzq"
+}

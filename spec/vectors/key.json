@@ -1,0 +1,6 @@
+{
+  "comment": "TEST ONLY. seed_hex is a fixed, public test seed (the ASCII text \"claim-check-v2 TEST ONLY seed!!!\"). Never use it as a real key.",
+  "seed_hex": "636c61696d2d636865636b2d76322054455354204f4e4c592073656564212121",
+  "public_key": "ed25519:ccV2lZz3g1MpIMDFtJlMqbv80bhFsrlmM7dSpqwXLNk",
+  "key_id": "ck_n6k2f752m56jhduskszg7jxtki"
+}
