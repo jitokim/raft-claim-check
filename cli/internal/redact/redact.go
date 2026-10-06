@@ -133,8 +133,10 @@ func (r *Redactor) WithHome(home string) *Redactor {
 // MaskHome replaces each occurrence of home in s with "~" when it ends on a
 // path boundary: the end of s, '/', ASCII whitespace, a quote or one of
 // ":;,)]}>|&". Any other next byte continues a path segment, so "/Users/bob"
-// masks "/Users/bob/x" but not "/Users/bobby". One trailing '/' is stripped
-// from home first; an empty or root home leaves s unchanged. The caller
+// masks "/Users/bob/x" but not "/Users/bobby". It must also start s or follow
+// a byte outside [A-Za-z0-9._~-], so "/mnt/Users/bob" is left unchanged while
+// "x=/Users/bob" and "file:///Users/bob" are masked. One trailing '/' is
+// stripped from home first; an empty or root home leaves s unchanged. The caller
 // injects home; MaskHome never reads the environment.
 func MaskHome(s, home string) string {
 	out, _ := maskHome(s, home)
@@ -157,7 +159,7 @@ func maskHome(s, home string) (string, []int) {
 			break
 		}
 		start, end := i+j, i+j+len(home)
-		if end < len(s) && !isPathBoundary(s[end]) {
+		if start > 0 && isPathNameChar(s[start-1]) || end < len(s) && !isPathBoundary(s[end]) {
 			i = start + 1
 			continue
 		}
@@ -177,6 +179,13 @@ func maskHome(s, home string) (string, []int) {
 // the path segment.
 func isPathBoundary(c byte) bool {
 	return strings.IndexByte("/ \t\n\r\v\f'\"`:;,)]}>|&", c) >= 0
+}
+
+// isPathNameChar reports whether c, the byte before a home occurrence,
+// continues a longer path.
+func isPathNameChar(c byte) bool {
+	return 'A' <= c && c <= 'Z' || 'a' <= c && c <= 'z' || '0' <= c && c <= '9' ||
+		strings.IndexByte("._~-", c) >= 0
 }
 
 type span struct {

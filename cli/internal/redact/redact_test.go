@@ -177,6 +177,12 @@ func TestMaskHome(t *testing.T) {
 		{"empty home", "/Users/bob/x", "", "/Users/bob/x"},
 		{"root home", "/Users/bob/x", "/", "/Users/bob/x"},
 		{"no occurrence", "nothing here", "/Users/bob", "nothing here"},
+		{"inside a longer path", "/mnt/Users/bob/x", "/Users/bob", "/mnt/Users/bob/x"},
+		{"inside a longer path at the end", "/Volumes/b/Users/bob", "/Users/bob", "/Volumes/b/Users/bob"},
+		{"after file url slashes", "file:///Users/bob/r.git", "/Users/bob", "file://~/r.git"},
+		{"after equals", "x=/Users/bob/y", "/Users/bob", "x=~/y"},
+		{"after a space", "cd /Users/bob/x", "/Users/bob", "cd ~/x"},
+		{"at the start", "/Users/bob", "/Users/bob", "~"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
