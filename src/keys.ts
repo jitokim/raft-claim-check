@@ -4,8 +4,8 @@ import { keyId, parsePublicKey, parseSignature, verifyEd25519 } from "./crypto";
 import { error, hasOnlyKeys, invalidRequest, isJsonObject, json, parseJsonObject, type JsonObject } from "./http";
 import { canonicalBytes } from "./jcs";
 import { reserve } from "./ratelimit";
-import type { KeyRow } from "./store";
-import { parseUtcMillis, toUtcMillis } from "./time";
+import type { KeyRow, RevokedReason } from "./store";
+import { parseRfc3339, parseUtcMillis, toUtcMillis } from "./time";
 
 export const REGISTRATION_SCHEMA = "claim-check.key-registration.v2";
 export const MAX_ACTIVE_KEYS = 5;
@@ -123,4 +123,60 @@ export const registerKey: ActionHandler = async (ctx: ActionContext, body) => {
   const raced = await store.getKey(statement.key_id);
   if (raced) return existingKey(session, raced);
   return error(409, "too_many_keys", `You already have ${MAX_ACTIVE_KEYS} active keys on this server; revoke one with revoke_key first.`);
+};
+
+/** The key record of list_keys and revoke_key. */
+function keyRecord(row: KeyRow) {
+  return {
+    key_id: row.key_id, public_key: row.public_key, label: row.label, status: row.revoked_at === null ? "active" : "revoked",
+    registered_at: row.registered_at, revoked_at: row.revoked_at, revoked_reason: row.revoked_reason, compromised_since: row.compromised_since,
+  };
+}
+
+export const listKeys: ActionHandler = async ({ store, session, now }, body) => {
+  if (!parseJsonObject(body)) return invalidRequest("The request body must be a JSON object without duplicate keys.");
+  const limited = await reserve(store, "read", session, now);
+  if (limited) return limited;
+  const rows = await store.listKeys(session.server_id, session.principal_id);
+  return json({ keys: rows.map(keyRecord) });
+};
+
+const REVOKE_REASONS: readonly string[] = ["rotated", "lost", "compromised"] satisfies RevokedReason[];
+const keyNotFound = () => error(404, "key_not_found", "No key with that key_id is registered to you on this server.");
+
+export const revokeKey: ActionHandler = async ({ store, session, now }, body) => {
+  const request = parseJsonObject(body);
+  if (!request || !hasOnlyKeys(request, ["key_id", "reason", "compromised_since"]) || typeof request.key_id !== "string" || typeof request.reason !== "string"
+    || (request.compromised_since !== undefined && typeof request.compromised_since !== "string")) {
+    return invalidRequest("The body must be a JSON object {key_id, reason, compromised_since?} with string values and no duplicate keys.");
+  }
+  const limited = await reserve(store, "revoke", session, now);
+  if (limited) return limited;
+
+  const reason = request.reason;
+  if (!REVOKE_REASONS.includes(reason)) return invalidRequest("reason must be rotated, lost or compromised.");
+  let since: number | null = null;
+  if (request.compromised_since !== undefined) {
+    if (reason !== "compromised") return invalidRequest("compromised_since is allowed only with reason compromised.");
+    since = parseRfc3339(request.compromised_since);
+    if (since === null) return invalidRequest("compromised_since must be an RFC 3339 time.");
+    if (since > now) return invalidRequest("compromised_since must not be in the future.");
+  }
+
+  const row = await store.getKey(request.key_id);
+  // Unknown and other-principal keys get the identical 404.
+  if (!row || row.server_id !== session.server_id || row.principal_id !== session.principal_id) return keyNotFound();
+  if (row.revoked_at !== null) return json(keyRecord(row));
+  if (since !== null && since < Date.parse(row.registered_at)) return invalidRequest("compromised_since must not be earlier than the key's registered_at.");
+
+  const revocation = {
+    keyId: row.key_id, serverId: session.server_id, principalId: session.principal_id, revokedAt: toUtcMillis(now),
+    reason: reason as RevokedReason, compromisedSince: reason === "compromised" ? (since === null ? row.registered_at : toUtcMillis(since)) : null,
+  };
+  if (await store.revokeKey(revocation)) {
+    return json(keyRecord({ ...row, revoked_at: revocation.revokedAt, revoked_reason: revocation.reason, compromised_since: revocation.compromisedSince }));
+  }
+  // A concurrent revocation won; return what it stored.
+  const current = await store.getKey(row.key_id);
+  return current ? json(keyRecord(current)) : keyNotFound();
 };

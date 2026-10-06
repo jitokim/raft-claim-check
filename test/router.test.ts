@@ -87,6 +87,20 @@ describe("router", () => {
     expect(await oversize.json()).toEqual({ error: "invalid_request", hint: "Request body exceeds 64 KB." });
   });
 
+  it("list_keys and revoke_key end to end", async () => {
+    const { call, sqlite } = setup();
+    const key = await agentKey();
+    expect((await call("/api/agent/actions/register-key", await registrationBody(key, statementFor(key, { issued_at: new Date().toISOString() })))).status).toBe(201);
+    const revoked = await call("/api/agent/actions/revoke-key", JSON.stringify({ key_id: key.keyId, reason: "compromised" }));
+    expect(revoked.status).toBe(200);
+    const record = await revoked.json() as Record<string, unknown>;
+    expect(record).toMatchObject({ key_id: key.keyId, status: "revoked", revoked_reason: "compromised", compromised_since: record.registered_at });
+    const listed = await call("/api/agent/actions/list-keys", "{}");
+    expect(await listed.json()).toEqual({ keys: [record] });
+    expect(sqlite.prepare("SELECT action, COUNT(*) AS n FROM rate_reservations GROUP BY action ORDER BY action").all().map((row) => ({ ...row })))
+      .toEqual([{ action: "read", n: 1 }, { action: "register", n: 1 }, { action: "revoke", n: 1 }]);
+  });
+
   it("answers unknown routes and methods with 404", async () => {
     const { env } = setup();
     const response = await worker.fetch(new Request(`${ORIGIN}/api/agent/actions/get-session`, { method: "GET" }), env);
