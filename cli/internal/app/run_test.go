@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/jitokim/raft-claim-check/cli/internal/receipt"
@@ -343,5 +344,28 @@ func TestRunClosedProcessStdoutDoesNotKillCLI(t *testing.T) {
 	}
 	if string(data) != "141 1 SIGPIPE" {
 		t.Fatalf("report = %q, want exit 141, 1 receipt submitted, exit.signal SIGPIPE", data)
+	}
+}
+
+func TestForwardSignal(t *testing.T) {
+	cases := []struct {
+		name                   string
+		sig                    os.Signal
+		child, cli, foreground int
+		want                   bool
+	}{
+		{"SIGINT, same group, foreground", syscall.SIGINT, 100, 100, 100, false},
+		{"SIGINT, child in another group", syscall.SIGINT, 200, 100, 100, true},
+		{"SIGINT, foreground unknown", syscall.SIGINT, 100, 100, -1, true},
+		{"SIGINT, child group unknown", syscall.SIGINT, -1, 100, 100, true},
+		{"SIGINT, CLI group not foreground", syscall.SIGINT, 100, 100, 300, true},
+		{"SIGTERM, same group, foreground", syscall.SIGTERM, 100, 100, 100, true},
+		{"SIGHUP, same group, foreground", syscall.SIGHUP, 100, 100, 100, true},
+		{"SIGQUIT, same group, foreground", syscall.SIGQUIT, 100, 100, 100, true},
+	}
+	for _, c := range cases {
+		if got := forwardSignal(c.sig, c.child, c.cli, c.foreground); got != c.want {
+			t.Errorf("%s: forwardSignal = %v, want %v", c.name, got, c.want)
+		}
 	}
 }

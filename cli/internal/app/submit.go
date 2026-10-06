@@ -33,21 +33,47 @@ type appError struct {
 	Hint  string `json:"hint"`
 }
 
-func parseAppError(status int, result []byte) appError {
-	var e appError
-	_ = json.Unmarshal(result, &e)
-	if e.Error == "" {
-		e.Error = fmt.Sprintf("http_%d", status)
+// knownSubmitErrors are submit_receipt's own error codes (design-v2.md,
+// "## Actions"). Only these prove that the app refused the receipt; a 4xx
+// without one may come from Raft itself (scope, install), not the app.
+var knownSubmitErrors = map[string]bool{
+	"invalid_request":    true,
+	"schema_unsupported": true,
+	"binding_mismatch":   true,
+	"key_not_registered": true,
+	"key_revoked":        true,
+	"bad_signature":      true,
+	"schema_invalid":     true,
+	"clock_skew":         true,
+	"receipt_too_old":    true,
+	"receipt_too_large":  true,
+}
+
+// parseAppError reads the app's {error, hint} body. ok is false when the
+// body is not JSON, "error" is not a string, or it is empty.
+func parseAppError(result []byte) (e appError, ok bool) {
+	if json.Unmarshal(result, &e) != nil || e.Error == "" {
+		return appError{}, false
 	}
 	e.Hint = oneLine(e.Hint)
-	return e
+	return e, true
+}
+
+// statusLine is "<status> <code>", or just the status when the body has no
+// app error code.
+func statusLine(status int, result []byte) string {
+	if ae, ok := parseAppError(result); ok {
+		return fmt.Sprintf("%d %s", status, ae.Error)
+	}
+	return fmt.Sprint(status)
 }
 
 func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }
 
 // submit sends a pending entry and applies the outcome to the spool: the
 // file is removed only after a 200 or 201 whose receipt_id equals the local
-// ID, moved to rejected/ on 400, 403, 409 or 413, and kept otherwise.
+// ID, moved to rejected/ on 400, 403, 409 or 413 with a known
+// submit_receipt error code, and kept otherwise.
 func (a *app) submit(p *profile, e spool.Entry) submitResult {
 	loginHint := fmt.Sprintf("run 'raft integration login --service %s', then 'claim-check flush'", p.service)
 	status, result, err := p.raft.Invoke("submit_receipt", e.Body)
@@ -86,15 +112,19 @@ func (a *app) submit(p *profile, e spool.Entry) submitResult {
 		return r
 	case status == 401:
 		return submitResult{outcome: outKept, stop: true,
-			summary: fmt.Sprintf("kept in spool: 401 %s; hint: %s", parseAppError(status, result).Error, loginHint)}
+			summary: fmt.Sprintf("kept in spool: %s; hint: %s", statusLine(status, result), loginHint)}
 	case status == 429:
 		return submitResult{outcome: outKept, stop: true,
 			summary: "kept in spool: 429 rate_limited; 'claim-check flush' retries it later"}
 	case status >= 500:
 		return submitResult{outcome: outKept,
-			summary: fmt.Sprintf("kept in spool: %d %s; 'claim-check flush' retries it", status, parseAppError(status, result).Error)}
+			summary: fmt.Sprintf("kept in spool: %s; 'claim-check flush' retries it", statusLine(status, result))}
 	case status == 400 || status == 403 || status == 409 || status == 413:
-		ae := parseAppError(status, result)
+		ae, ok := parseAppError(result)
+		if !ok || !knownSubmitErrors[ae.Error] {
+			return submitResult{outcome: outKept,
+				summary: fmt.Sprintf("kept in spool: %s without a known submit_receipt error, outcome unknown; 'claim-check flush' retries it", statusLine(status, result))}
+		}
 		rej := spool.Rejection{Status: status, Error: ae.Error, Hint: ae.Hint}
 		if err := spool.Reject(p.paths, e, rej, a.Now()); err != nil {
 			return submitResult{outcome: outKept,
