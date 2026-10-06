@@ -452,7 +452,7 @@ The app never upgrades an asserted field to verified, and never reads the repo, 
 
 **Decision:** v2 keeps v1's single D1 database. `sessions` and `blocked_servers` are unchanged. `github_budget` is dropped, `receipts` is replaced, `keys` is added, and `rate_reservations` gets a generic unit column. **Rejected:** a second store for keys (such as KV), for the same consistency reason v1 gave: a revoked key must stop working on every edge at once.
 
-Migration `0002_v2.sql`:
+Migration `0003_v2.sql` (numbered after v1's 0001 and 0002, which are already applied in production):
 
 ```sql
 DROP TABLE IF EXISTS github_budget;
