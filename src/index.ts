@@ -1,13 +1,11 @@
 import manifest from "./manifest.json";
+import type { ActionHandler, Session } from "./context";
 import type { Env } from "./env";
 import { CALLBACK_PATH, MANIFEST_PATH, SESSION_COOKIE, SESSION_SECONDS } from "./env";
+import { error, json, readBody } from "./http";
+import { reserve } from "./ratelimit";
+import { D1Store } from "./store";
 
-const json = (body: unknown, status = 200, headers = new Headers()): Response => {
-  headers.set("Content-Type", "application/json; charset=utf-8");
-  headers.set("Cache-Control", "no-store");
-  return new Response(JSON.stringify(body), { status, headers });
-};
-const error = (status: number, code: string, hint: string, headers?: Headers) => json({ error: code, hint }, status, headers);
 const canonicalOrigin = (env: Env) => env.CANONICAL_ORIGIN.replace(/\/$/, "");
 const callbackUrl = (env: Env) => `${canonicalOrigin(env)}${CALLBACK_PATH}`;
 const nowIso = () => new Date().toISOString();
@@ -85,11 +83,6 @@ async function callback(request: Request, env: Env): Promise<Response> {
   }
 }
 
-interface Session {
-  id_hash: string; server_id: string; server_slug: string; server_name: string | null;
-  principal_id: string; principal_type: string; display_name: string | null; scopes: string; expires_at: string;
-}
-
 function cookieValue(request: Request): string | null {
   const value = request.headers.get("Cookie")?.split(";").map((part) => part.trim()).find((part) => part.startsWith(`${SESSION_COOKIE}=`));
   return value ? value.slice(SESSION_COOKIE.length + 1) : null;
@@ -106,33 +99,36 @@ async function authenticate(request: Request, env: Env): Promise<{ session?: Ses
   return { session };
 }
 
-async function reserveRead(env: Env, session: Session): Promise<Response | undefined> {
-  const now = Date.now();
-  const result = await env.DB.prepare("INSERT INTO rate_reservations (server_id, principal_id, action, units, created_at) SELECT ?, ?, 'read', 1, ? WHERE (SELECT COUNT(*) FROM rate_reservations WHERE server_id = ? AND principal_id = ? AND action = 'read' AND created_at > ?) < 120")
-    .bind(session.server_id, session.principal_id, now, session.server_id, session.principal_id, now - 60_000).run();
-  if (result.meta.changes === 1) return;
-  const oldest = await env.DB.prepare("SELECT MIN(created_at) AS oldest FROM rate_reservations WHERE server_id = ? AND principal_id = ? AND action = 'read' AND created_at > ?").bind(session.server_id, session.principal_id, now - 60_000).first<{ oldest: number | null }>();
-  const seconds = Math.max(1, Math.ceil(((oldest?.oldest ?? now) + 60_000 - now) / 1000));
-  const headers = new Headers({ "Retry-After": String(seconds) });
-  return error(429, "rate_limited", "Read limit exceeded; retry after the indicated delay.", headers);
+// v1 actions parse leniently, exactly as request.json() did: UTF-8 with replacement, BOM stripped, JSON.parse.
+function lenientJsonObject(body: Uint8Array): Record<string, unknown> | null {
+  try {
+    const value: unknown = JSON.parse(new TextDecoder().decode(body));
+    return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
 }
 
-async function action(request: Request, env: Env, actionName: "get-session" | "get-receipt"): Promise<Response> {
-  const auth = await authenticate(request, env);
-  if (!auth.session) return auth.response!;
-  let body: unknown;
-  try { body = await request.json(); } catch { return actionName === "get-session" ? error(400, "invalid_request", "The request body must be a JSON object.") : error(400, "invalid_request", "The request body must be a JSON object."); }
-  if (!body || typeof body !== "object" || Array.isArray(body)) return error(400, "invalid_request", "The request body must be a JSON object.");
+const getSession: ActionHandler = async (ctx, body) => {
+  if (!lenientJsonObject(body)) return error(400, "invalid_request", "The request body must be a JSON object.");
+  const limited = await reserve(ctx.store, "read", ctx.session, ctx.now);
+  if (limited) return limited;
+  const { session } = ctx;
+  return json({ principal: { id: session.principal_id, type: session.principal_type, display_name: session.display_name }, server: { id: session.server_id, slug: session.server_slug, name: session.server_name }, session_expires_at: session.expires_at });
+};
+
+const getReceipt = (db: D1Database): ActionHandler => async (ctx, body) => {
+  const request = lenientJsonObject(body);
+  if (!request) return error(400, "invalid_request", "The request body must be a JSON object.");
   // The design intentionally maps malformed and absent IDs to the same 404 as
   // unknown, expired, deleted, and other-server receipts.
-  const limited = await reserveRead(env, auth.session);
+  const limited = await reserve(ctx.store, "read", ctx.session, ctx.now);
   if (limited) return limited;
-  if (actionName === "get-session") return json({ principal: { id: auth.session.principal_id, type: auth.session.principal_type, display_name: auth.session.display_name }, server: { id: auth.session.server_id, slug: auth.session.server_slug, name: auth.session.server_name }, session_expires_at: auth.session.expires_at });
-  const id = typeof (body as { receipt_id?: unknown }).receipt_id === "string" ? (body as { receipt_id: string }).receipt_id : "";
-  const receipt = await env.DB.prepare("SELECT body_json FROM receipts WHERE id = ? AND server_id = ? AND expires_at > ?").bind(id, auth.session.server_id, nowIso()).first<{ body_json: string }>();
+  const id = typeof request.receipt_id === "string" ? request.receipt_id : "";
+  const receipt = await db.prepare("SELECT body_json FROM receipts WHERE id = ? AND server_id = ? AND expires_at > ?").bind(id, ctx.session.server_id, nowIso()).first<{ body_json: string }>();
   if (!receipt) return error(404, "receipt_not_found", "No accessible, unexpired receipt has that ID.");
   return new Response(receipt.body_json, { headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } });
-}
+};
 
 async function purge(env: Env): Promise<void> {
   const now = new Date();
@@ -150,15 +146,21 @@ export default {
     if (url.origin !== canonicalOrigin(env)) return error(404, "not_found", "No route matches this request.");
     if (url.pathname === MANIFEST_PATH && request.method === "GET") return json(manifest);
     if (url.pathname === CALLBACK_PATH && request.method === "GET") return callback(request, env);
-    const routes: Record<string, "get-session" | "get-receipt"> = {
-      "/api/agent/actions/get-session": "get-session",
-      "/api/agent/actions/get-receipt": "get-receipt",
+    const routes: Record<string, ActionHandler> = {
+      "/api/agent/actions/get-session": getSession,
+      "/api/agent/actions/get-receipt": getReceipt(env.DB),
     };
     const route = routes[url.pathname];
     if (route && request.method === "POST") {
-      const bodyBytes = await request.clone().arrayBuffer();
-      if (bodyBytes.byteLength > 65_536) return error(400, "invalid_request", "Request body exceeds 64 KB.");
-      try { return await action(request, env, route); } catch { return error(500, "internal_error", "The request could not be completed."); }
+      try {
+        const body = await readBody(request);
+        if (!body) return error(400, "invalid_request", "Request body exceeds 64 KB.");
+        const auth = await authenticate(request, env);
+        if (!auth.session) return auth.response!;
+        return await route({ store: new D1Store(env.DB), session: auth.session, now: Date.now() }, body);
+      } catch {
+        return error(500, "internal_error", "The request could not be completed.");
+      }
     }
     return error(404, "not_found", "No route matches this request.");
   },
