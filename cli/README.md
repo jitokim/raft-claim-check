@@ -4,7 +4,17 @@
 
 ## Install and build
 
-The CLI needs Go 1.25 to build and has no dependencies outside the standard library. At run time it needs the Raft CLI (`raft`, with Agent Login) on `PATH`, and `git` for the git fields.
+Prebuilt binaries for Linux and macOS (amd64, arm64) are on the [GitHub releases page](https://github.com/jitokim/raft-claim-check/releases). Check the download against the release's `SHA256SUMS` before you run it:
+
+```bash
+v=v2.0.0; f=claim-check_darwin_arm64   # or claim-check_{linux,darwin}_{amd64,arm64}
+curl -fsSLO "https://github.com/jitokim/raft-claim-check/releases/download/$v/$f"
+curl -fsSLO "https://github.com/jitokim/raft-claim-check/releases/download/$v/SHA256SUMS"
+grep " $f\$" SHA256SUMS | shasum -a 256 -c -   # or sha256sum -c -
+chmod +x "$f" && mv "$f" ~/.local/bin/claim-check
+```
+
+To build from source, the CLI needs Go 1.25 to build and has no dependencies outside the standard library. At run time it needs the Raft CLI (`raft`, with Agent Login) on `PATH`, and `git` for the git fields.
 
 ```bash
 make -C cli test      # gofmt check, go vet, go test
@@ -12,7 +22,7 @@ make -C cli release   # static binaries (CGO_ENABLED=0) in cli/dist/ plus cli/di
 go -C cli build -o claim-check .   # one binary for this machine
 ```
 
-`make release` builds `claim-check_{linux,darwin}_{amd64,arm64}` and writes `SHA256SUMS` with `sha256sum`, or `shasum -a 256` where `sha256sum` is missing (macOS). Set `VERSION=...` to stamp `cli.version`; the default is `2.0.0-dev`. `cli/dist/` is ignored by git. The repository has no CI workflow and no published release.
+`make release` builds `claim-check_{linux,darwin}_{amd64,arm64}` and writes `SHA256SUMS` with `sha256sum`, or `shasum -a 256` where `sha256sum` is missing (macOS). Set `VERSION=...` to stamp `cli.version`; the default is `2.0.0-dev`. `cli/dist/` is ignored by git. The repository has no CI workflow; releases are built with `make release VERSION=<x.y.z>` and uploaded by hand.
 
 First use on a machine, for each agent profile:
 
