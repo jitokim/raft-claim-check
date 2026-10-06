@@ -1,7 +1,7 @@
 // Receipt actions (docs/design-v2.md, ## Verification, ## Receipt visibility and ## What a receipt proves and does not prove).
 import type { ActionHandler, Session } from "./context";
 import { parsePublicKey, parseSignature, receiptId, verifyEd25519 } from "./crypto";
-import { error, hasOnlyKeys, invalidRequest, isJsonObject, json, type JsonObject } from "./http";
+import { error, hasOnlyKeys, invalidRequest, isJsonObject, json, parseJsonObject, type JsonObject } from "./http";
 import { canonicalBytes, canonicalize, JsonError, parseJson, type NumberIssue } from "./jcs";
 import { reserve } from "./ratelimit";
 import { validatePayload, type ReceiptPayload } from "./receipt-schema";
@@ -103,6 +103,23 @@ export function storedReceiptBody(stored: StoredReceipt) {
   };
   return { receipt_id: stored.id, envelope: JSON.parse(stored.envelope_json) as JsonObject, ledger };
 }
+
+const receiptNotFound = () => error(404, "receipt_not_found", "No accessible, unexpired receipt has that ID.");
+
+/**
+ * get_receipt: one query scoped by the session's server and to unexpired rows. Unknown, malformed, expired and
+ * other-server IDs all get the identical 404. Members other than receipt_id are ignored, as list_keys ignores its body.
+ */
+export const getReceipt: ActionHandler = async ({ store, session, now }, body) => {
+  const request = parseJsonObject(body);
+  if (!request) return invalidRequest("The request body must be a JSON object {receipt_id} without duplicate keys.");
+  const limited = await reserve(store, "read", session, now);
+  if (limited) return limited;
+  const id = request.receipt_id;
+  // A non-string ID cannot match a row; it gets the same 404 without a query that could tell it apart.
+  const stored = typeof id === "string" ? await store.readReceipt(id, session.server_id, toUtcMillis(now)) : null;
+  return stored ? json(storedReceiptBody(stored)) : receiptNotFound();
+};
 
 /** Step 4's parse: duplicate keys and malformed JSON fail here; number-domain issues are only recorded, for step 10. */
 function parseRequest(body: Uint8Array, numberIssues: NumberIssue[]): JsonObject | null {

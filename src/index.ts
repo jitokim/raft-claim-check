@@ -5,7 +5,7 @@ import { CALLBACK_PATH, MANIFEST_PATH, SESSION_COOKIE, SESSION_SECONDS } from ".
 import { error, json, readBody } from "./http";
 import { listKeys, registerKey, revokeKey } from "./keys";
 import { reserve } from "./ratelimit";
-import { submitReceipt } from "./receipts";
+import { getReceipt, submitReceipt } from "./receipts";
 import { D1Store } from "./store";
 
 const canonicalOrigin = (env: Env) => env.CANONICAL_ORIGIN.replace(/\/$/, "");
@@ -101,7 +101,7 @@ async function authenticate(request: Request, env: Env): Promise<{ session?: Ses
   return { session };
 }
 
-// v1 actions parse leniently, exactly as request.json() did: UTF-8 with replacement, BOM stripped, JSON.parse.
+// get_session is carried over from v1 unchanged, so it parses leniently, exactly as request.json() did: UTF-8 with replacement, BOM stripped, JSON.parse.
 function lenientJsonObject(body: Uint8Array): Record<string, unknown> | null {
   try {
     const value: unknown = JSON.parse(new TextDecoder().decode(body));
@@ -119,19 +119,17 @@ const getSession: ActionHandler = async (ctx, body) => {
   return json({ principal: { id: session.principal_id, type: session.principal_type, display_name: session.display_name }, server: { id: session.server_id, slug: session.server_slug, name: session.server_name }, session_expires_at: session.expires_at });
 };
 
-const getReceipt = (db: D1Database): ActionHandler => async (ctx, body) => {
-  const request = lenientJsonObject(body);
-  if (!request) return error(400, "invalid_request", "The request body must be a JSON object.");
-  // The design intentionally maps malformed and absent IDs to the same 404 as
-  // unknown, expired, deleted, and other-server receipts.
-  const limited = await reserve(ctx.store, "read", ctx.session, ctx.now);
-  if (limited) return limited;
-  const id = typeof request.receipt_id === "string" ? request.receipt_id : "";
-  const receipt = await db.prepare("SELECT body_json FROM receipts WHERE id = ? AND server_id = ? AND expires_at > ?").bind(id, ctx.session.server_id, nowIso()).first<{ body_json: string }>();
-  if (!receipt) return error(404, "receipt_not_found", "No accessible, unexpired receipt has that ID.");
-  return new Response(receipt.body_json, { headers: { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } });
+/** The six v2 actions, all POST. */
+const ROUTES: Readonly<Record<string, ActionHandler>> = {
+  "/api/agent/actions/register-key": registerKey,
+  "/api/agent/actions/submit-receipt": submitReceipt,
+  "/api/agent/actions/get-receipt": getReceipt,
+  "/api/agent/actions/get-session": getSession,
+  "/api/agent/actions/list-keys": listKeys,
+  "/api/agent/actions/revoke-key": revokeKey,
 };
 
+/** The daily purge: expired receipts, reservations older than the longest window (1 hour), and sessions as in v1. Keys are never deleted. */
 async function purge(env: Env): Promise<void> {
   const now = new Date();
   const sessionCutoff = new Date(now.getTime() - 7 * 86_400_000).toISOString();
@@ -148,15 +146,7 @@ export default {
     if (url.origin !== canonicalOrigin(env)) return error(404, "not_found", "No route matches this request.");
     if (url.pathname === MANIFEST_PATH && request.method === "GET") return json(manifest);
     if (url.pathname === CALLBACK_PATH && request.method === "GET") return callback(request, env);
-    const routes: Record<string, ActionHandler> = {
-      "/api/agent/actions/get-session": getSession,
-      "/api/agent/actions/get-receipt": getReceipt(env.DB),
-      "/api/agent/actions/register-key": registerKey,
-      "/api/agent/actions/submit-receipt": submitReceipt,
-      "/api/agent/actions/list-keys": listKeys,
-      "/api/agent/actions/revoke-key": revokeKey,
-    };
-    const route = routes[url.pathname];
+    const route = ROUTES[url.pathname];
     if (route && request.method === "POST") {
       try {
         // Verification step 1 runs before the session check: an oversize body is refused without a cookie lookup.
