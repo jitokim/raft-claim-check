@@ -108,7 +108,7 @@ async function authenticate(request: Request, env: Env): Promise<{ session?: Ses
 
 async function reserveRead(env: Env, session: Session): Promise<Response | undefined> {
   const now = Date.now();
-  const result = await env.DB.prepare("INSERT INTO rate_reservations (server_id, principal_id, action, claim_count, created_at) SELECT ?, ?, 'read', 0, ? WHERE (SELECT COUNT(*) FROM rate_reservations WHERE server_id = ? AND principal_id = ? AND action = 'read' AND created_at > ?) < 120")
+  const result = await env.DB.prepare("INSERT INTO rate_reservations (server_id, principal_id, action, units, created_at) SELECT ?, ?, 'read', 1, ? WHERE (SELECT COUNT(*) FROM rate_reservations WHERE server_id = ? AND principal_id = ? AND action = 'read' AND created_at > ?) < 120")
     .bind(session.server_id, session.principal_id, now, session.server_id, session.principal_id, now - 60_000).run();
   if (result.meta.changes === 1) return;
   const oldest = await env.DB.prepare("SELECT MIN(created_at) AS oldest FROM rate_reservations WHERE server_id = ? AND principal_id = ? AND action = 'read' AND created_at > ?").bind(session.server_id, session.principal_id, now - 60_000).first<{ oldest: number | null }>();
