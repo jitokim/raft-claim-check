@@ -78,7 +78,10 @@ export interface Store {
   revokeKey(revocation: Revocation): Promise<boolean>;
   /** The key only if it is bound to exactly this server and principal, revoked or not. */
   getBoundKey(keyId: string, serverId: string, principalId: string): Promise<KeyRow | null>;
-  /** INSERT ... ON CONFLICT(id) DO NOTHING; true only if this call stored the row. */
+  /**
+   * One conditional INSERT ... ON CONFLICT(id) DO NOTHING: the row is stored only while its bound key (key_id, server_id,
+   * principal_id) is unrevoked. True only if this call stored the row.
+   */
   insertReceipt(receipt: ReceiptRow): Promise<boolean>;
   /** One query: the receipt with this ID on this server, unexpired at `now` (RFC 3339), joined with its key's current state. */
   readReceipt(id: string, serverId: string, now: string): Promise<StoredReceipt | null>;
@@ -144,9 +147,10 @@ export class D1Store implements Store {
   async insertReceipt(receipt: ReceiptRow): Promise<boolean> {
     const result = await this.db.prepare(
       "INSERT INTO receipts (id, server_id, principal_id, principal_type, key_id, kind, signed_at, received_at, expires_at, envelope_json, ledger_json) " +
-      "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO NOTHING",
+      "SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? " +
+      "WHERE EXISTS (SELECT 1 FROM keys WHERE key_id = ? AND server_id = ? AND principal_id = ? AND revoked_at IS NULL) ON CONFLICT(id) DO NOTHING",
     ).bind(receipt.id, receipt.server_id, receipt.principal_id, receipt.principal_type, receipt.key_id, receipt.kind, receipt.signed_at,
-      receipt.received_at, receipt.expires_at, receipt.envelope_json, receipt.ledger_json).run();
+      receipt.received_at, receipt.expires_at, receipt.envelope_json, receipt.ledger_json, receipt.key_id, receipt.server_id, receipt.principal_id).run();
     return result.meta.changes === 1;
   }
 

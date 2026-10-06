@@ -66,6 +66,8 @@ export class MemoryStore implements Store {
 
   async insertReceipt(receipt: ReceiptRow): Promise<boolean> {
     if (this.receipts.some((row) => row.id === receipt.id)) return false;
+    const key = this.keys.find((row) => row.key_id === receipt.key_id && row.server_id === receipt.server_id && row.principal_id === receipt.principal_id);
+    if (!key || key.revoked_at !== null) return false;
     this.receipts.push({ ...receipt });
     return true;
   }

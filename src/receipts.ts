@@ -5,7 +5,7 @@ import { error, hasOnlyKeys, invalidRequest, isJsonObject, json, parseJsonObject
 import { canonicalBytes, canonicalize, JsonError, parseJson, type NumberIssue } from "./jcs";
 import { reserve } from "./ratelimit";
 import { validatePayload, type ReceiptPayload } from "./receipt-schema";
-import type { KeyRow, StoredReceipt } from "./store";
+import type { KeyRow, Store, StoredReceipt } from "./store";
 import { toUtcMillis } from "./time";
 
 export const RECEIPT_SCHEMA = "claim-check.receipt.v2";
@@ -147,6 +147,23 @@ async function signatureVerifies(key: KeyRow, payload: JsonObject, signature: Js
   return verifyEd25519(parsePublicKey(key.public_key), signatureBytes, message);
 }
 
+const KEY_REVOKED_MESSAGE = "This key was revoked and can sign no new receipts.";
+
+/**
+ * The already-stored receipt for this payload, if any. Numbers are not validated until step 10, so a payload whose ID
+ * cannot be derived (it was never stored) yields null.
+ */
+async function readStoredDuplicate(store: Store, payload: JsonObject, session: Session, now: number, numberIssues: readonly NumberIssue[]): Promise<StoredReceipt | null> {
+  if (numberIssues.length > 0) return null;
+  let id: string;
+  try {
+    id = await receiptId(payload);
+  } catch {
+    return null;
+  }
+  return store.readReceipt(id, session.server_id, toUtcMillis(now));
+}
+
 /**
  * submit_receipt, steps 4 to 13 of ## Verification; the router has run steps 1 (size, 413) to 3 (session, scopes,
  * blocked_servers). Each step returns at its first failure.
@@ -178,10 +195,15 @@ export const submitReceipt: ActionHandler = async ({ store, session, now }, body
     return error(400, "binding_mismatch", "payload.bound_to must be this session's server_id and principal_id, and signature.key_id must equal payload.key_id.");
   }
 
-  // 8. Key lookup and binding: unknown and bound-elsewhere keys get the identical 403.
+  // 8. Key lookup and binding: unknown and bound-elsewhere keys get the identical 403. A revoked key's receipt that was
+  // already stored (a retry after a lost response) is still the duplicate it would have been, not a rejection.
   const key = await store.getBoundKey(payload.key_id, session.server_id, session.principal_id);
   if (!key) return error(403, "key_not_registered", "This key is not registered to you on this server; run claim-check key register.");
-  if (key.revoked_at !== null) return error(403, "key_revoked", "This key was revoked and can sign no new receipts.");
+  if (key.revoked_at !== null) {
+    const stored = await readStoredDuplicate(store, payload, session, now, numberIssues);
+    if (stored) return json({ ...storedReceiptBody(stored), duplicate: true }, 200);
+    return error(403, "key_revoked", KEY_REVOKED_MESSAGE);
+  }
 
   // 9. Signature.
   if (!(await signatureVerifies(key, payload, signature))) {
@@ -196,7 +218,8 @@ export const submitReceipt: ActionHandler = async ({ store, session, now }, body
   if (valid.signedAt > now + MAX_FUTURE_SKEW_MS) return error(400, "clock_skew", "payload.signed_at is more than 5 minutes in the future; check this machine's clock.");
   if (valid.signedAt < now - MAX_AGE_MS) return error(400, "receipt_too_old", "payload.signed_at is more than 7 days ago; the receipt can no longer be accepted.");
 
-  // 12. Replay and duplicates. The payload is integer-only from here on, so plain JCS applies.
+  // 12. Replay and duplicates. The payload is integer-only from here on, so plain JCS applies. The insert stores the row
+  // only while the key is unrevoked, so a revoke_key that commits after step 8 leaves no receipt received after revoked_at.
   const id = await receiptId(payload);
   const envelope = { payload, signature };
   const ledger = buildLedger(valid.payload, session, key, now, valid.signedAt);
@@ -207,8 +230,9 @@ export const submitReceipt: ActionHandler = async ({ store, session, now }, body
   });
   if (!inserted) {
     // The ID derives from a payload that names this server and principal, so the stored row is on this server.
+    // No row means the key was revoked since step 8.
     const stored = await store.readReceipt(id, session.server_id, ledger.received_at);
-    if (!stored) throw new Error("A conflicting receipt row could not be read back.");
+    if (!stored) return error(403, "key_revoked", KEY_REVOKED_MESSAGE);
     return json({ ...storedReceiptBody(stored), duplicate: true }, 200);
   }
 
