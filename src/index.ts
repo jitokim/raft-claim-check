@@ -95,7 +95,10 @@ async function authenticate(request: Request, env: Env): Promise<{ session?: Ses
   if (!rawId || !/^[a-f0-9]{64}$/.test(rawId) || !env.SESSION_SECRET) return { response: error(401, "not_authenticated", "Run raft integration login to create a Claim Check session.") };
   const idHash = await hmac(env.SESSION_SECRET, rawId);
   const session = await env.DB.prepare("SELECT id_hash, server_id, server_slug, server_name, principal_id, principal_type, display_name, scopes, expires_at FROM sessions WHERE id_hash = ? AND expires_at > ? AND revoked_at IS NULL").bind(idHash, nowIso()).first<Session>();
-  if (!session || !session.scopes.split(" ").includes("openid") || !session.scopes.split(" ").includes("profile")) return { response: error(401, "not_authenticated", "Run raft integration login to create a Claim Check session.") };
+  if (!session) return { response: error(401, "not_authenticated", "Run raft integration login to create a Claim Check session.") };
+  // Verification step 3: a live session without the scopes is a valid identity that is not authorized, so 403.
+  const scopes = session.scopes.split(" ");
+  if (!scopes.includes("openid") || !scopes.includes("profile")) return { response: error(403, "not_authorized", "The Claim Check session must include openid and profile scopes.") };
   const blocked = await env.DB.prepare("SELECT 1 FROM blocked_servers WHERE server_id = ?").bind(session.server_id).first();
   if (blocked) return { response: error(403, "not_authorized", "This Raft server is not authorized to use Claim Check.") };
   return { session };

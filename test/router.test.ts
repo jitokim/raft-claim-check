@@ -49,6 +49,28 @@ describe("router", () => {
     expect(await response.json()).toEqual({ error: "not_authorized", hint: "This Raft server is not authorized to use Claim Check." });
   });
 
+  it("returns 403 not_authorized for a live session without the openid and profile scopes, and still passes a scoped one", async () => {
+    const { call, sqlite } = setup();
+    for (const scopes of ["", "openid", "profile", "openid email"]) {
+      sqlite.prepare("UPDATE sessions SET scopes = ?").run(scopes);
+      const response = await call("/api/agent/actions/get-session", "{}");
+      expect(response.status).toBe(403);
+      expect(await response.json()).toEqual({ error: "not_authorized", hint: "The Claim Check session must include openid and profile scopes." });
+    }
+    sqlite.prepare("UPDATE sessions SET scopes = 'openid profile'").run();
+    expect((await call("/api/agent/actions/get-session", "{}")).status).toBe(200);
+  });
+
+  it("keeps 401 not_authenticated for an expired or revoked session", async () => {
+    const { call, sqlite } = setup();
+    sqlite.prepare("UPDATE sessions SET expires_at = ?").run(new Date(Date.now() - 1000).toISOString());
+    expect(await (await call("/api/agent/actions/get-session", "{}")).json()).toMatchObject({ error: "not_authenticated" });
+    sqlite.prepare("UPDATE sessions SET expires_at = ?, revoked_at = ?").run(new Date(Date.now() + 3_600_000).toISOString(), new Date().toISOString());
+    const revoked = await call("/api/agent/actions/get-session", "{}");
+    expect(revoked.status).toBe(401);
+    expect(await revoked.json()).toMatchObject({ error: "not_authenticated" });
+  });
+
   it("get_session is unchanged: body, lenient JSON object, 120 reads per minute", async () => {
     const { call, sqlite, expiresAt } = setup();
     const response = await call("/api/agent/actions/get-session", '{"x":1.5}');
@@ -122,7 +144,9 @@ describe("router", () => {
       expect(await response.json()).toMatchObject({ error: "not_authenticated" });
     }
     sqlite.prepare("UPDATE sessions SET scopes = 'openid'").run();
-    expect((await call("/api/agent/actions/submit-receipt", "not json")).status).toBe(401);
+    const unscoped = await call("/api/agent/actions/submit-receipt", "not json");
+    expect(unscoped.status).toBe(403);
+    expect(await unscoped.json()).toMatchObject({ error: "not_authorized" });
     sqlite.prepare("UPDATE sessions SET scopes = 'openid profile'").run();
     sqlite.prepare("INSERT INTO blocked_servers (server_id, blocked_at, reason) VALUES ('srv_a', '2026-10-06T00:00:00.000Z', 'test')").run();
     const blocked = await call("/api/agent/actions/submit-receipt", "not json");
