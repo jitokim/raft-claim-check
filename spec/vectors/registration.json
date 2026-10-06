@@ -1,0 +1,33 @@
+{
+  "payload": {
+    "cli_version": "2.0.0-test",
+    "issued_at": "2026-10-06T08:59:00.000Z",
+    "key_id": "ck_n6k2f752m56jhduskszg7jxtki",
+    "label": "laptop-test",
+    "nonce": "AwMDAwMDAwMDAwMDAwMDAw",
+    "principal_id": "agent_test",
+    "public_key": "ed25519:ccV2lZz3g1MpIMDFtJlMqbv80bhFsrlmM7dSpqwXLNk",
+    "schema": "claim-check.key-registration.v2",
+    "server_id": "srv_test"
+  },
+  "jcs": "{\"cli_version\":\"2.0.0-test\",\"issued_at\":\"2026-10-06T08:59:00.000Z\",\"key_id\":\"ck_n6k2f752m56jhduskszg7jxtki\",\"label\":\"laptop-test\",\"nonce\":\"AwMDAwMDAwMDAwMDAwMDAw\",\"principal_id\":\"agent_test\",\"public_key\":\"ed25519:ccV2lZz3g1MpIMDFtJlMqbv80bhFsrlmM7dSpqwXLNk\",\"schema\":\"claim-check.key-registration.v2\",\"server_id\":\"srv_test\"}",
+  "sha256": "db2c5be328e13fe6739f54826b71d8443a76425cf0af76d9e3a628201dd47f35",
+  "envelope": {
+    "payload": {
+      "cli_version": "2.0.0-test",
+      "issued_at": "2026-10-06T08:59:00.000Z",
+      "key_id": "ck_n6k2f752m56jhduskszg7jxtki",
+      "label": "laptop-test",
+      "nonce": "AwMDAwMDAwMDAwMDAwMDAw",
+      "principal_id": "agent_test",
+      "public_key": "ed25519:ccV2lZz3g1MpIMDFtJlMqbv80bhFsrlmM7dSpqwXLNk",
+      "schema": "claim-check.key-registration.v2",
+      "server_id": "srv_test"
+    },
+    "signature": {
+      "alg": "ed25519",
+      "key_id": "ck_n6k2f752m56jhduskszg7jxtki",
+      "value": "ed25519:OpgIgS6QTT4Yy09NWlQBUFS1oSE7CP8yCJnEoWfsh1cVvXg3hL7fIHmQMr-m90jNHTtwkqcvPaHoWwyl9uCCBw"
+    }
+  }
+}
