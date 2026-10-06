@@ -12,6 +12,7 @@ import (
 	"io/fs"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -98,8 +99,10 @@ func (c *CLI) Whoami() (string, string, error) {
 }
 
 // Invoke runs `raft integration invoke <service> <action> --data-file - --json`
-// with body on stdin. Output must be {"ok", "data": {"status", "result"}};
-// anything else is ErrUnknownOutcome (or a more specific error).
+// with body on stdin. The output is read by ParseInvokeOutput, which yields
+// the app's status and body for both the success and the
+// INTEGRATION_INVOKE_FAILED shape; anything else is ErrUnknownOutcome (or a
+// more specific error).
 func (c *CLI) Invoke(action string, body []byte) (int, []byte, error) {
 	stdout, stderr, err := c.exec(InvokeArgv(c.Service, action), body)
 	if errors.Is(err, ErrTimeout) || errors.Is(err, ErrNotInstalled) {
@@ -114,9 +117,32 @@ func (c *CLI) Invoke(action string, body []byte) (int, []byte, error) {
 	return 0, nil, fmt.Errorf("%w%s", ErrUnknownOutcome, detail(stdout, stderr))
 }
 
-// ParseInvokeOutput reads the `raft integration invoke --json` output shape
-// {"ok": bool, "data": {"service", "action", "status": int, "result": any}}.
-// It reports ok=false for anything that does not have that shape.
+// InvokeFailedCode is the error.code raft reports when the app answered with
+// a non-2xx status.
+const InvokeFailedCode = "INTEGRATION_INVOKE_FAILED"
+
+// invokeFailedBody precedes the app's body in an INTEGRATION_INVOKE_FAILED
+// message, and invokeFailedStatus finds the status before it.
+const invokeFailedBody = "response body: "
+
+var invokeFailedStatus = regexp.MustCompile(`HTTP (\d{3})`)
+
+// ParseInvokeOutput reads the `raft integration invoke --json` output
+// (shapes confirmed 2026-10-06) and returns the app's HTTP status and body.
+//
+// Success is {"ok": true, "data": {"service", "action", "status": int,
+// "result": any}}: status = data.status, result = data.result. Any output
+// with that data shape is read this way, whatever ok says.
+//
+// Failure is {"ok": false, "error": {"code": "INTEGRATION_INVOKE_FAILED",
+// "message": "service action failed (HTTP 404); response body: {...}", ...}}:
+// status = the `HTTP nnn` in the message (100-599, looked for before
+// "response body: "), result = the text after "response body: ", trimmed.
+// That text is passed on even when it is not JSON, and result is nil when it
+// is missing, so the status still decides the outcome.
+//
+// It reports ok=false for anything else, including an ok:false output with
+// another error.code or without a status in its message.
 func ParseInvokeOutput(stdout []byte) (status int, result []byte, ok bool) {
 	var out struct {
 		OK   *bool `json:"ok"`
@@ -124,20 +150,39 @@ func ParseInvokeOutput(stdout []byte) (status int, result []byte, ok bool) {
 			Status *json.Number    `json:"status"`
 			Result json.RawMessage `json:"result"`
 		} `json:"data"`
+		Error *struct {
+			Code    string `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
 	}
 	dec := json.NewDecoder(bytes.NewReader(stdout))
 	dec.UseNumber()
-	if err := dec.Decode(&out); err != nil || dec.More() {
+	if err := dec.Decode(&out); err != nil || dec.More() || out.OK == nil {
 		return 0, nil, false
 	}
-	if out.OK == nil || out.Data == nil || out.Data.Status == nil || out.Data.Result == nil {
+	if out.Data != nil && out.Data.Status != nil && out.Data.Result != nil {
+		n, err := out.Data.Status.Int64()
+		if err != nil || n < 100 || n > 599 {
+			return 0, nil, false
+		}
+		return int(n), []byte(out.Data.Result), true
+	}
+	if *out.OK || out.Error == nil || out.Error.Code != InvokeFailedCode {
 		return 0, nil, false
 	}
-	n, err := out.Data.Status.Int64()
+	head, body, hasBody := strings.Cut(out.Error.Message, invokeFailedBody)
+	m := invokeFailedStatus.FindStringSubmatch(head)
+	if m == nil {
+		return 0, nil, false
+	}
+	n, err := strconv.Atoi(m[1])
 	if err != nil || n < 100 || n > 599 {
 		return 0, nil, false
 	}
-	return int(n), []byte(out.Data.Result), true
+	if body = strings.TrimSpace(body); !hasBody || body == "" {
+		return n, nil, true
+	}
+	return n, []byte(body), true
 }
 
 func (c *CLI) exec(args []string, stdin []byte) (stdout, stderr []byte, err error) {

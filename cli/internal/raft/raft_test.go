@@ -1,6 +1,7 @@
 package raft
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -168,6 +169,93 @@ func TestWhoamiFailures(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			bin, _, _ := fakeBin(t, c.out, "", c.code)
 			if _, _, err := (&CLI{Bin: bin}).Whoami(); !errors.Is(err, ErrWhoami) {
+				t.Fatalf("err = %v", err)
+			}
+		})
+	}
+}
+
+// invokeFailed is raft's real failure output (captured 2026-10-06) for code
+// and message.
+func invokeFailed(code, message string) string {
+	b, _ := json.Marshal(map[string]any{"ok": false, "error": map[string]any{
+		"code": code, "message": message, "fault_domain": nil, "layer": nil,
+		"retryable": nil, "effect": nil, "correlation_id": nil}})
+	return string(b)
+}
+
+func TestParseInvokeOutputSuccess(t *testing.T) {
+	out := `{"ok":true,"data":{"service":"s","action":"a","status":201,"result":{"receipt_id":"rcpt_x"}}}`
+	status, result, ok := ParseInvokeOutput([]byte(out))
+	if !ok || status != 201 || string(result) != `{"receipt_id":"rcpt_x"}` {
+		t.Fatalf("got %d %s %v", status, result, ok)
+	}
+}
+
+func TestParseInvokeOutputInvokeFailed(t *testing.T) {
+	cases := []struct {
+		name, message string
+		status        int
+		result        string
+	}{
+		{"404 receipt_not_found", `service action failed (HTTP 404); response body: {"error":"receipt_not_found","hint":"no such receipt"}`,
+			404, `{"error":"receipt_not_found","hint":"no such receipt"}`},
+		{"403 key_revoked", `service action failed (HTTP 403); response body: {"error":"key_revoked","hint":"the key is revoked"}`,
+			403, `{"error":"key_revoked","hint":"the key is revoked"}`},
+		{"401", `service action failed (HTTP 401); response body: {"error":"not_authenticated","hint":"log in"}`,
+			401, `{"error":"not_authenticated","hint":"log in"}`},
+		{"500 non-JSON body", `service action failed (HTTP 500); response body: upstream exploded`, 500, "upstream exploded"},
+		{"no response body", `service action failed (HTTP 429)`, 429, ""},
+		{"empty response body", `service action failed (HTTP 502); response body: `, 502, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			status, result, ok := ParseInvokeOutput([]byte(invokeFailed(InvokeFailedCode, c.message)))
+			if !ok || status != c.status || string(result) != c.result {
+				t.Fatalf("got %d %q %v, want %d %q", status, result, ok, c.status, c.result)
+			}
+		})
+	}
+}
+
+func TestParseInvokeOutputNotParsed(t *testing.T) {
+	cases := map[string]string{
+		"no HTTP status":           invokeFailed(InvokeFailedCode, "service action failed: connection reset"),
+		"status out of range":      invokeFailed(InvokeFailedCode, `failed (HTTP 999); response body: {}`),
+		"status only in the body":  invokeFailed(InvokeFailedCode, `failed; response body: {"error":"HTTP 403"}`),
+		"other error code":         invokeFailed("INTEGRATION_NOT_FOUND", `failed (HTTP 403); response body: {"error":"key_revoked","hint":"h"}`),
+		"ok true with error":       `{"ok":true,"error":{"code":"INTEGRATION_INVOKE_FAILED","message":"failed (HTTP 403)"}}`,
+		"ok false without error":   `{"ok":false}`,
+		"error is a string":        `{"ok":false,"error":"not logged in"}`,
+		"missing ok":               `{"error":{"code":"INTEGRATION_INVOKE_FAILED","message":"failed (HTTP 403)"}}`,
+		"trailing data after JSON": invokeFailed(InvokeFailedCode, `failed (HTTP 403)`) + " {}",
+	}
+	for name, out := range cases {
+		t.Run(name, func(t *testing.T) {
+			if status, result, ok := ParseInvokeOutput([]byte(out)); ok {
+				t.Fatalf("parsed as %d %q", status, result)
+			}
+		})
+	}
+}
+
+func TestInvokeFailedOutputGivesStatusAndBody(t *testing.T) {
+	out := invokeFailed(InvokeFailedCode, `service action failed (HTTP 403); response body: {"error":"key_revoked","hint":"h"}`)
+	bin, _, _ := fakeBin(t, out, "", 1)
+	status, result, err := (&CLI{Bin: bin, Service: "s"}).Invoke("a", []byte("{}"))
+	if err != nil || status != 403 || string(result) != `{"error":"key_revoked","hint":"h"}` {
+		t.Fatalf("got %d %s %v", status, result, err)
+	}
+}
+
+func TestInvokeFailedOutputWithoutStatusIsUnknown(t *testing.T) {
+	for name, out := range map[string]string{
+		"no HTTP status":   invokeFailed(InvokeFailedCode, "service action failed: connection reset"),
+		"other error code": invokeFailed("SOMETHING_ELSE", "failed (HTTP 403); response body: {}"),
+	} {
+		t.Run(name, func(t *testing.T) {
+			bin, _, _ := fakeBin(t, out, "", 1)
+			if _, _, err := (&CLI{Bin: bin, Service: "s"}).Invoke("a", []byte("{}")); !errors.Is(err, ErrUnknownOutcome) {
 				t.Fatalf("err = %v", err)
 			}
 		})

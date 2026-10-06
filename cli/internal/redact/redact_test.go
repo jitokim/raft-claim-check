@@ -18,16 +18,25 @@ var (
 	jwt    = "eyJhbGciOiJIUzI1NiJ9" + "." + "eyJzdWIiOiIxIn0" + "." + "c2lnbmF0dXJl"
 )
 
+// pem assembles a PEM private-key armor line at runtime, e.g. pem("BEGIN", "RSA");
+// an empty kind yields the bare form with no kind word.
+func pem(edge, kind string) string {
+	if kind != "" {
+		kind += " "
+	}
+	return "-----" + edge + " " + kind + "PRIVATE" + " KEY-----"
+}
+
 func TestEachRule(t *testing.T) {
 	r := New([]string{"MY_API_TOKEN=s3cr3t-env-value", "SHORT_TOKEN=abc", "PATH=/usr/bin:/bin"})
 	cases := []struct {
 		name, in, want string
 	}{
-		{"private_key", "a\n-----BEGIN RSA PRIVATE KEY-----\nMIIBOgIBAAJB\n-----END RSA PRIVATE KEY-----\nb",
+		{"private_key", "a\n" + pem("BEGIN", "RSA") + "\nMIIBOgIBAAJB\n" + pem("END", "RSA") + "\nb",
 			"a\n[REDACTED:private_key]\nb"},
-		{"private_key without footer", "x\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXk\nAAAA",
+		{"private_key without footer", "x\n" + pem("BEGIN", "OPENSSH") + "\nb3BlbnNzaC1rZXk\nAAAA",
 			"x\n[REDACTED:private_key]"},
-		{"private_key footer only", "zzzz\nyyyy\n-----END PRIVATE KEY-----\nafter", "[REDACTED:private_key]\nafter"},
+		{"private_key footer only", "zzzz\nyyyy\n" + pem("END", "") + "\nafter", "[REDACTED:private_key]\nafter"},
 		{"bearer header", "Authorization: Basic dXNlcjpwYXNz\nnext", "Authorization: [REDACTED:bearer]\nnext"},
 		{"bearer token", "curl -H 'X: Bearer abc.def-123'", "curl -H 'X: Bearer [REDACTED:bearer]'"},
 		{"known_token github", "token " + ghp + " end", "token [REDACTED:known_token] end"},

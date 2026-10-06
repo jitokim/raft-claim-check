@@ -1,6 +1,7 @@
 package app
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -74,6 +75,90 @@ func TestSubmitFailureTable(t *testing.T) {
 				data, _ := os.ReadFile(rejected[0])
 				if !strings.Contains(string(data), `"rejection":{"error":`) || !strings.Contains(string(data), `"receipt":{"payload"`) {
 					t.Fatalf("rejected file = %s", data)
+				}
+			}
+		})
+	}
+}
+
+// invokeOutput answers with raft's raw --json output, read the way
+// raft.CLI.Invoke reads it: unparsed output is an unknown outcome.
+func invokeOutput(stdout string) handler {
+	return func([]byte) (int, []byte, error) {
+		if code, result, ok := raft.ParseInvokeOutput([]byte(stdout)); ok {
+			return code, result, nil
+		}
+		return 0, nil, fmt.Errorf("%w (%s)", raft.ErrUnknownOutcome, stdout)
+	}
+}
+
+// invokeFailed is raft's real failure output (captured 2026-10-06).
+func invokeFailed(code, message string) string {
+	return string(jsonBytes(map[string]any{"ok": false, "error": map[string]any{
+		"code": code, "message": message, "fault_domain": nil, "layer": nil,
+		"retryable": nil, "effect": nil, "correlation_id": nil}}))
+}
+
+// TestSubmitInvokeFailedOutput applies the submit-failure table to the
+// status and body embedded in an INTEGRATION_INVOKE_FAILED message.
+func TestSubmitInvokeFailedOutput(t *testing.T) {
+	failed := func(status int, body string) string {
+		return invokeFailed(raft.InvokeFailedCode, fmt.Sprintf("service action failed (HTTP %d); response body: %s", status, body))
+	}
+	cases := []struct {
+		name      string
+		stdout    string
+		want      outcome
+		message   string
+		rejection map[string]any
+	}{
+		{"404 receipt_not_found", failed(404, `{"error":"receipt_not_found","hint":"no such receipt"}`), outKept, "unexpected status 404, outcome unknown", nil},
+		{"403 key_revoked", failed(403, `{"error":"key_revoked","hint":"the key is revoked; run key register"}`), outRejected,
+			"rejected: 403 key_revoked: the key is revoked; run key register",
+			map[string]any{"status": float64(403), "error": "key_revoked", "hint": "the key is revoked; run key register"}},
+		{"401", failed(401, `{"error":"not_authenticated","hint":"log in"}`), outKept,
+			"kept in spool: 401 not_authenticated; hint: run 'raft integration login --service claim-check'", nil},
+		{"429", failed(429, `{"error":"rate_limited","hint":"slow down"}`), outKept, "kept in spool: 429 rate_limited", nil},
+		{"500", failed(500, `{"error":"internal_error","hint":"x"}`), outKept, "kept in spool: 500 internal_error", nil},
+		{"no HTTP status", invokeFailed(raft.InvokeFailedCode, "service action failed: connection reset"), outKept, "outcome unknown", nil},
+		{"non-JSON body still uses the status", failed(403, `<html>Forbidden</html>`), outRejected, "rejected: 403 http_403",
+			map[string]any{"status": float64(403), "error": "http_403", "hint": ""}},
+		{"other error code with HTTP 403", invokeFailed("INTEGRATION_NOT_FOUND", `service action failed (HTTP 403); response body: {"error":"key_revoked","hint":"h"}`),
+			outKept, "submit outcome unknown", nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.setupKey()
+			p := h.paths()
+			h.handlers["submit_receipt"] = invokeOutput(c.stdout)
+			if code := h.run("run", "--", "true"); code != 0 {
+				t.Fatalf("exit %d: the child's code must pass through", code)
+			}
+			if !strings.Contains(h.stderr.String(), c.message) {
+				t.Fatalf("line %q does not contain %q", h.stderr.String(), c.message)
+			}
+			pending, rejected := h.spoolFiles(p.SpoolDir), h.spoolFiles(p.RejectedDir)
+			switch c.want {
+			case outKept:
+				if len(pending) != 1 || len(rejected) != 0 {
+					t.Fatalf("pending %d rejected %d, want 1/0", len(pending), len(rejected))
+				}
+			case outRejected:
+				if len(pending) != 0 || len(rejected) != 1 {
+					t.Fatalf("pending %d rejected %d, want 0/1", len(pending), len(rejected))
+				}
+				data, _ := os.ReadFile(rejected[0])
+				var file struct {
+					Rejection map[string]any `json:"rejection"`
+				}
+				if err := json.Unmarshal(data, &file); err != nil {
+					t.Fatalf("rejected file = %s: %v", data, err)
+				}
+				for k, v := range c.rejection {
+					if file.Rejection[k] != v {
+						t.Fatalf("rejection.%s = %v, want %v (file %s)", k, file.Rejection[k], v, data)
+					}
 				}
 			}
 		})
