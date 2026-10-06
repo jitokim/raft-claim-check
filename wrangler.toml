@@ -9,7 +9,7 @@ CANONICAL_ORIGIN = "https://claim-check.ohmygraph.workers.dev"
 [[d1_databases]]
 binding = "DB"
 database_name = "claim-check"
-database_id = "REPLACE_WITH_CREATED_D1_DATABASE_ID"
+database_id = "1eb00d45-556e-4b08-b662-4c7ffac36f19"
 migrations_dir = "migrations"
 
 [triggers]
