@@ -23,7 +23,7 @@ const (
 type submitResult struct {
 	outcome   outcome
 	duplicate bool
-	stop      bool   // flush stops here (401, 429, Raft CLI missing, not logged in)
+	stop      bool   // flush stops here (401, 429, other 4xx without an app code, Raft CLI missing, not logged in)
 	summary   string // one line, without the receipt ID
 }
 
@@ -73,7 +73,7 @@ func oneLine(s string) string { return strings.Join(strings.Fields(s), " ") }
 // submit sends a pending entry and applies the outcome to the spool: the
 // file is removed only after a 200 or 201 whose receipt_id equals the local
 // ID, moved to rejected/ on 400, 403, 409 or 413 with a known
-// submit_receipt error code, and kept otherwise.
+// submit_receipt error code, and kept otherwise. A kept 4xx stops flush.
 func (a *app) submit(p *profile, e spool.Entry) submitResult {
 	loginHint := fmt.Sprintf("run 'raft integration login --service %s', then 'claim-check flush'", p.service)
 	status, result, err := p.raft.Invoke("submit_receipt", e.Body)
@@ -122,7 +122,9 @@ func (a *app) submit(p *profile, e spool.Entry) submitResult {
 	case status == 400 || status == 403 || status == 409 || status == 413:
 		ae, ok := parseAppError(result)
 		if !ok || !knownSubmitErrors[ae.Error] {
-			return submitResult{outcome: outKept,
+			// No app code: Raft refused before the app (scope, install), so
+			// every later receipt would fail the same way.
+			return submitResult{outcome: outKept, stop: true,
 				summary: fmt.Sprintf("kept in spool: %s without a known submit_receipt error, outcome unknown; 'claim-check flush' retries it", statusLine(status, result))}
 		}
 		rej := spool.Rejection{Status: status, Error: ae.Error, Hint: ae.Hint}
@@ -136,6 +138,6 @@ func (a *app) submit(p *profile, e spool.Entry) submitResult {
 		}
 		return submitResult{outcome: outRejected, summary: msg + "; moved to spool/rejected/, not retried"}
 	}
-	return submitResult{outcome: outKept,
+	return submitResult{outcome: outKept, stop: status >= 400 && status < 500,
 		summary: fmt.Sprintf("kept in spool: unexpected status %d, outcome unknown; 'claim-check flush' retries it", status)}
 }

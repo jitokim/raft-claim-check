@@ -247,6 +247,51 @@ func TestFlushStopsOn401And429(t *testing.T) {
 	}
 }
 
+// A 4xx without a known app error code comes from Raft (scope, install), not
+// the receipt, so flush stops instead of retrying every receipt against it.
+// A 5xx keeps going.
+func TestFlushStopsOnUnknown4xx(t *testing.T) {
+	cases := []struct {
+		name  string
+		code  int
+		body  string
+		stops bool
+	}{
+		{"Raft-side 403", 403, `{"error":{"code":"INTEGRATION_INVOKE_FAILED","message":"missing scope"}}`, true},
+		{"400 without a body", 400, ``, true},
+		{"404", 404, `{"error":"nope"}`, true},
+		{"500", 500, `{"error":"internal_error","hint":"x"}`, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			h := newHarness(t)
+			h.setupKey()
+			ids := spoolThree(t, h)
+			n := 0
+			h.handlers["submit_receipt"] = func(body []byte) (int, []byte, error) {
+				n++
+				if n == 2 {
+					return c.code, []byte(c.body), nil
+				}
+				return acceptSubmit(201)(body)
+			}
+			if exit := h.run("flush"); exit != 75 {
+				t.Fatalf("exit %d, want 75", exit)
+			}
+			want, summary := ids[:2], "1 stored, 0 rejected, 0 expired, 2 still pending"
+			if !c.stops {
+				want, summary = ids, "2 stored, 0 rejected, 0 expired, 1 still pending"
+			}
+			if got := h.submittedIDs(); strings.Join(got, ",") != strings.Join(want, ",") {
+				t.Fatalf("submitted %v, want %v", got, want)
+			}
+			if !strings.Contains(h.stderr.String(), summary) {
+				t.Fatalf("summary: %s", h.stderr.String())
+			}
+		})
+	}
+}
+
 // A 4xx without a known app error code is kept and counted as pending, and a
 // later flush retries and stores it.
 func TestFlushRetriesReceiptKeptOnUnknown4xx(t *testing.T) {
